@@ -129,19 +129,3 @@ if gelu_test_accuracy > relu_test_accuracy:
     print(f"\nGELU wins by {gelu_test_accuracy - relu_test_accuracy:.2f} percentage points!")
 else:
     print(f"\nReLU wins by {relu_test_accuracy - gelu_test_accuracy:.2f} percentage points!")
-
-# Create accuracy comparison plot
-plt.figure(figsize=(10, 6))
-epochs_range = range(1, len(relu_val_accuracies) + 1)
-plt.plot(epochs_range, relu_val_accuracies, 'b-o', label='ReLU', linewidth=2, markersize=6)
-plt.plot(epochs_range, gelu_val_accuracies, 'r-s', label='GELU', linewidth=2, markersize=6)
-plt.title('Validation Accuracy: ReLU vs GELU Activation Functions', fontsize=14, fontweight='bold')
-plt.xlabel('Epoch', fontsize=12)
-plt.ylabel('Validation Accuracy (%)', fontsize=12)
-plt.legend(fontsize=12)
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.savefig('relu_vs_gelu_accuracy.png', dpi=300, bbox_inches='tight')
-plt.show()
-
-print(f"\nAccuracy graph saved as 'relu_vs_gelu_accuracy.png'")
