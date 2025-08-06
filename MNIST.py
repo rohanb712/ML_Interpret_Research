@@ -1,131 +1,141 @@
 import torch
-import torchvision
-from torchvision.datasets import MNIST
-import matplotlib.pyplot as plt
-import torchvision.transforms as transforms
-from torch.utils.data import random_split
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import random
+from typing import Callable
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
-])
+_lin = lambda x, w: torch.einsum("bd,dh->bh", x, w)
 
-dataset = MNIST(root='data/', train=True, download=True, transform=transform)
+transform = transforms.ToTensor()
+train_dataset = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+test_dataset = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
 
-train_set, val_set = random_split(dataset, [50000, 10000])
-
-batch_size = 64
-train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
-
-test_set = MNIST(root='data/', train=False, download=True, transform=transform)
-test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
-
-class FFN(nn.Module):
-    def __init__(self, activation_fn):
+class FFN_ReLU(nn.Module):
+    def __init__(self, hidden_dim):
         super().__init__()
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(784, 128)
-        self.act1 = activation_fn
-        self.fc2 = nn.Linear(128, 64)
-        self.act2 = activation_fn
-        self.fc3 = nn.Linear(64, 10)
+        self.W_in = nn.Parameter(torch.randn(784, hidden_dim) * 0.02)
+        self.W_out = nn.Parameter(torch.randn(hidden_dim, 10) * 0.02)
 
     def forward(self, x):
-        x = self.flatten(x)
-        x = self.fc1(x)
-        x = self.act1(x)
-        x = self.fc2(x)
-        x = self.act2(x)
-        x = self.fc3(x)
-        return x
+        x = x.view(x.size(0), -1)
+        h = torch.relu(_lin(x, self.W_in))
+        return torch.einsum("bh,hc->bc", h, self.W_out)
 
-def train_model(model, train_loader, val_loader, epochs=5, lr=0.001):
+class FFN_GeGLU(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.W_in = nn.Parameter(torch.randn(784, hidden_dim) * 0.02)
+        self.W_gate = nn.Parameter(torch.randn(784, hidden_dim) * 0.02)
+        self.W_out = nn.Parameter(torch.randn(hidden_dim, 10) * 0.02)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x_proj = _lin(x, self.W_in)
+        x_gate = F.gelu(_lin(x, self.W_gate))
+        return torch.einsum("bh,hc->bc", x_proj * x_gate, self.W_out)
+
+def train_and_validate_model(model, train_loader, val_loader, lr, max_epochs=1):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    train_losses = []
-    val_accuracies = []
-    
-    for epoch in range(epochs):
+    for epoch in range(max_epochs):
         model.train()
-        total_loss = 0
-        for batch_idx, (data, target) in enumerate(train_loader):
+        for batch_idx, (x, y) in enumerate(train_loader):
             optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
+            output = model(x)
+            loss = criterion(output, y)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-        
-        avg_train_loss = total_loss / len(train_loader)
-        train_losses.append(avg_train_loss)
-        
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for data, target in val_loader:
-                output = model(data)
-                _, predicted = torch.max(output.data, 1)
-                total += target.size(0)
-                correct += (predicted == target).sum().item()
-        
-        val_accuracy = 100 * correct / total
-        val_accuracies.append(val_accuracy)
-        
-        print(f'Epoch {epoch+1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%')
     
-    return train_losses, val_accuracies
-
-def evaluate_model(model, test_loader):
-    """
-    Evaluate model on test set and return accuracy
-    """
     model.eval()
-    correct = 0
-    total = 0
+    val_accs = []
     with torch.no_grad():
-        for data, target in test_loader:
-            output = model(data)
-            _, predicted = torch.max(output.data, 1)
-            total += target.size(0)
-            correct += (predicted == target).sum().item()
+        for x, y in val_loader:
+            preds = model(x).argmax(dim=1)
+            acc = (preds == y).float().mean()
+            val_accs.append(acc)
     
-    accuracy = 100 * correct / total
-    return accuracy
+    avg_acc = torch.stack(val_accs).mean()
+    return avg_acc.item()
 
-print("Creating ReLU and GELU models...")
-relu_model = FFN(nn.ReLU())
-gelu_model = FFN(nn.GELU())
+print("Phase 1: Hidden Dim Sweep")
+hidden_dims = [2, 4, 8, 16]
+acc_relu, acc_geglu = [], []
 
-print("\n" + "="*50)
-print("Training ReLU Model")
-print("="*50)
-relu_train_losses, relu_val_accuracies = train_model(relu_model, train_loader, val_loader)
+for h in hidden_dims:
+    for model_class, accs, name in [(FFN_ReLU, acc_relu, "ReLU"), (FFN_GeGLU, acc_geglu, "GeGLU")]:
+        print(f"{name} - Hidden Dim = {h}")
+        model = model_class(h)
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+        val_loader = DataLoader(test_dataset, batch_size=64)
+        acc = train_and_validate_model(model, train_loader, val_loader, lr=1e-3, max_epochs=1)
+        accs.append(acc)
 
-print("\n" + "="*50)
-print("Training GELU Model")
-print("="*50)
-gelu_train_losses, gelu_val_accuracies = train_model(gelu_model, train_loader, val_loader)
+plt.figure()
+plt.plot(hidden_dims, acc_relu, label="ReLU", marker="o")
+plt.plot(hidden_dims, acc_geglu, label="GeGLU", marker="o")
+plt.xlabel("Hidden Dimension")
+plt.ylabel("Validation Accuracy")
+plt.title("Accuracy vs Hidden Dim")
+plt.legend()
+plt.grid(True)
+plt.savefig("hidden_dim_sweep.png")
+plt.show()
 
-print("\n" + "="*50)
-print("Final Test Results")
-print("="*50)
-relu_test_accuracy = evaluate_model(relu_model, test_loader)
-gelu_test_accuracy = evaluate_model(gelu_model, test_loader)
+def run_k_trials(model_class, label, k):
+    print(f"Running {label} Trials (k={k})")
+    trials = []
+    for i in range(k):
+        bs = random.choice([8, 64])
+        lr = random.choice([1e-1, 1e-2, 1e-3, 1e-4])
+        model = model_class(8)
+        train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True)
+        val_loader = DataLoader(test_dataset, batch_size=64)
+        acc = train_and_validate_model(model, train_loader, val_loader, lr=lr, max_epochs=1)
+        print(f"Trial {i+1}: BS={bs}, LR={lr:.0e}, Acc={acc:.4f}")
+        trials.append(acc)
+    return trials
 
-print(f"ReLU Model Test Accuracy: {relu_test_accuracy:.2f}%")
-print(f"GELU Model Test Accuracy: {gelu_test_accuracy:.2f}%")
+def bootstrap_ci(data, samples=10_000):
+    sample_matrix = np.random.choice(data, size=(samples, len(data)), replace=True)
+    max_per_sample = sample_matrix.max(axis=1)
+    ci = np.percentile(max_per_sample, [2.5, 97.5])
+    return max_per_sample, ci
 
-print(f"\nFinal Validation Accuracies:")
-print(f"ReLU: {relu_val_accuracies[-1]:.2f}%")
-print(f"GELU: {gelu_val_accuracies[-1]:.2f}%")
+for k in [2, 4, 8]:
+    relu_trials = run_k_trials(FFN_ReLU, "ReLU", k)
+    geglu_trials = run_k_trials(FFN_GeGLU, "GeGLU", k)
 
-if gelu_test_accuracy > relu_test_accuracy:
-    print(f"\nGELU wins by {gelu_test_accuracy - relu_test_accuracy:.2f} percentage points!")
-else:
-    print(f"\nReLU wins by {relu_test_accuracy - gelu_test_accuracy:.2f} percentage points!")
+    relu_boot, relu_ci = bootstrap_ci(relu_trials)
+    geglu_boot, geglu_ci = bootstrap_ci(geglu_trials)
+
+    print(f"ReLU CI (95%): {relu_ci[0]:.4f} - {relu_ci[1]:.4f}")
+    print(f"GeGLU CI (95%): {geglu_ci[0]:.4f} - {geglu_ci[1]:.4f}")
+
+    plt.figure()
+    plt.bar(["ReLU", "GeGLU"], [max(relu_trials), max(geglu_trials)], color=["skyblue", "orange"])
+    plt.ylabel("Best Validation Accuracy")
+    plt.title(f"Best Accuracy per Model (k={k})")
+    plt.ylim(0.8, 1.0)
+    plt.savefig(f"accuracy_vs_k_{k}.png")
+    plt.show()
+
+    plt.figure()
+    sns.histplot(relu_boot, label="ReLU", color="skyblue", kde=False)
+    sns.histplot(geglu_boot, label="GeGLU", color="orange", kde=False)
+    plt.axvline(relu_ci[0], linestyle="--", color="blue")
+    plt.axvline(relu_ci[1], linestyle="--", color="blue")
+    plt.axvline(geglu_ci[0], linestyle="--", color="red")
+    plt.axvline(geglu_ci[1], linestyle="--", color="red")
+    plt.title(f"Bootstrap CI (k={k})")
+    plt.xlabel("Max Validation Accuracy")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"bootstrap_ci_k{k}.png")
+    plt.show()

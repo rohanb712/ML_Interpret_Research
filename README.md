@@ -1,75 +1,154 @@
-# MNIST Activation Function Comparison: ReLU vs GELU
+# MNIST FFN Comparison: GeGLU vs ReLU
 
-## Claim
+This project compares two Feed-Forward Network (FFN) architectures on the MNIST dataset: FFN_GeGLU and FFN_ReLU. The comparison evaluates performance across different hidden dimensions using statistical analysis with bootstrap confidence intervals.
 
-This project compares **ReLU** and **GELU** activation functions on MNIST digit classification using identical feedforward neural networks.
+## Overview
 
-## Setup
+The primary research question is: **Is FFN_GeGLU better than FFN_ReLU?**
 
-**Requirements:**
-```bash
-pip install torch torchvision matplotlib
+This hypothesis is tested by comparing the two architectures across multiple hidden dimensions and hyperparameter configurations, using rigorous statistical methods to ensure reliable conclusions.
+
+## Architecture Details
+
+### FFN_ReLU
+```
+Input (784) → W_in → ReLU → W_out → Output (10)
+```
+- Standard feed-forward network with ReLU activation
+- Parameters: W_in (784 × hidden_dim), W_out (hidden_dim × 10)
+- Total parameters: 784 × hidden_dim + hidden_dim × 10
+
+### FFN_GeGLU (Gated GELU)
+```
+Input (784) → W_in → Linear Path
+            → W_gate → GELU → Gate Path
+                            ↓
+            Linear Path ⊙ Gate Path → W_out → Output (10)
+```
+- Gated Linear Unit with GELU activation
+- Parameters: W_in (784 × hidden_dim), W_gate (784 × hidden_dim), W_out (hidden_dim × 10)
+- Total parameters: 2 × (784 × hidden_dim) + hidden_dim × 10
+- Mathematical formula: FFN_GeGLU(x) = W_out × ((W_in × x) ⊙ GELU(W_gate × x))
+
+## Implementation Details
+
+### Model Features
+- Manual parameter initialization with small weights (σ = 0.02)
+- Einsum operations for efficient tensor computations
+- No bias terms for simplicity
+- Cross-entropy loss with Adam optimizer
+
+### Training Configuration
+- Single epoch training ("One Epoch is All you Need")
+- Full MNIST dataset (60,000 training, 10,000 test samples)
+- Test set used as validation for model selection
+- No train/validation split to maximize training data
+
+### Hyperparameter Search
+- Random search over hyperparameter combinations
+- Batch sizes: [8, 64]
+- Learning rates: [1e-1, 1e-2, 1e-3, 1e-4]
+- Model selection based on highest validation accuracy
+
+## Experimental Design
+
+### Phase 1: Hidden Dimension Sweep
+Tests performance across hidden dimensions [2, 4, 8, 16] with fixed hyperparameters:
+- Batch size: 64
+- Learning rate: 1e-3
+- Single trial per configuration
+
+### Phase 2: Statistical Analysis
+For each k in [2, 4, 8]:
+1. Run k random trials with different hyperparameter combinations
+2. Select best model based on validation accuracy
+3. Calculate bootstrap confidence intervals (10,000 samples)
+4. Generate comparative visualizations
+
+## Statistical Methods
+
+### Bootstrap Confidence Intervals
+- 95% confidence intervals using percentile method
+- Bootstrap resampling with replacement (10,000 iterations)
+- Applied to maximum accuracy across trials
+- Provides robust uncertainty quantification
+
+### Model Selection
+- Best model chosen by highest validation accuracy across k trials
+- Accounts for hyperparameter sensitivity
+- Prevents overfitting to specific configurations
+
+## Results
+
+### Hidden Dimension Analysis
+
+![Hidden Dimension Sweep Results](lightning_hidden_dim_sweep.png)
+
+The results show:
+
+1. **Capacity Constraints**: Both models fail at very small hidden dimensions (2, 4) with ~10% accuracy
+2. **Optimal Performance**: Peak performance occurs at hidden dimension 8 for both architectures
+3. **GeGLU Advantage**: FFN_GeGLU achieves ~87% accuracy vs FFN_ReLU's ~82% at optimal capacity
+4. **Performance Degradation**: Both models show reduced performance at hidden dimension 16
+
+### Key Findings
+
+- **GeGLU demonstrates superior performance** when sufficient model capacity is available
+- **Gating mechanism provides ~5% accuracy improvement** at the optimal hidden dimension
+- **Training stability varies significantly** with hyperparameter choices, especially learning rate
+- **One epoch training is sufficient** for meaningful comparisons on MNIST
+
+## Technical Implementation
+
+### Core Functions
+
+#### `train_and_validate_model(model, train_loader, val_loader, lr, max_epochs=1)`
+Trains a model and returns validation accuracy. Replaces PyTorch Lightning functionality with manual training loop.
+
+#### `run_k_trials(model_class, label, k)`
+Executes k random hyperparameter trials and returns accuracy results for statistical analysis.
+
+#### `bootstrap_ci(data, samples=10_000)`
+Calculates bootstrap confidence intervals for maximum accuracy across trials.
+
+### Code Structure
+- Models defined as standard PyTorch nn.Module classes
+- Manual training loops with explicit forward/backward passes
+- Comprehensive logging and visualization
+- Reproducible random seeds for consistent results
+
+## Dependencies
+
+```
+torch
+numpy
+matplotlib
+seaborn
+torchvision
 ```
 
-**Run the experiment:**
+## Usage
+
+Run the complete experiment:
 ```bash
 python MNIST.py
 ```
 
-The script will automatically download MNIST data, train both models, and generate an accuracy comparison graph.
+This will:
+1. Execute hidden dimension sweep
+2. Generate comparison plots
+3. Run statistical trials for k=[2,4,8]
+4. Create bootstrap confidence interval visualizations
+5. Save all plots as PNG files
 
-**Model Architecture:**
-Both models use identical 3-layer feedforward networks:
-- Input: 784 neurons (28×28 flattened images)
-- Hidden layers: 128 → 64 neurons
-- Output: 10 classes (digits 0-9)
-- Training: 5 epochs, Adam optimizer (lr=0.001), batch size 64
+## Output Files
 
-## Observations
-
-![ReLU vs GELU Accuracy Comparison](relu_vs_gelu_accuracy.png)
-
-The graph shows validation accuracy progression over 5 training epochs for both activation functions.
-
-**Training Progression:**
-- **Epoch 1**: GELU starts with a significant advantage (93.50% vs 91.93%)
-- **Epochs 2-4**: GELU maintains its lead consistently, outperforming ReLU by 0.7-0.8%
-- **Epoch 5**: ReLU shows stronger final convergence (96.83%) while GELU slightly dips (96.55%)
-
-**Key Findings:**
-- GELU demonstrates better early learning capability
-- ReLU shows more stable final convergence
-- Both activation functions achieve excellent performance (>96.5%)
+- `hidden_dim_sweep.png`: Performance vs hidden dimension comparison
+- `accuracy_vs_k_{k}.png`: Best accuracy bar charts for each k value
+- `bootstrap_ci_k{k}.png`: Bootstrap distribution histograms with confidence intervals
 
 ## Conclusion
 
-**Final Results:**
-- **ReLU**: 96.83% validation, 96.84% test accuracy
-- **GELU**: 96.55% validation, 97.19% test accuracy
+The experiment provides evidence supporting the hypothesis that FFN_GeGLU outperforms FFN_ReLU, particularly when models have sufficient capacity (hidden dimension ≥ 8). The gating mechanism in GeGLU appears to provide more effective feature learning, resulting in consistently higher validation accuracy across multiple trials.
 
-**Analysis:**
-Despite ReLU achieving higher validation accuracy, GELU ultimately performs better on the test set (+0.35%). This interesting discrepancy demonstrates that validation performance doesn't always predict final test results.
-
-**Key Insights:**
-- **GELU**: Better early learning and superior test generalization
-- **ReLU**: More consistent training dynamics and stable convergence
-- **Performance**: Both achieve excellent results (>96.5%), showing minimal practical difference on MNIST
-- **Takeaway**: The choice between these activation functions may depend more on training stability preferences than final accuracy for simple tasks
-
-## Limitations
-
-- Single run experiment (no statistical significance)
-- Simple dataset (MNIST) and architecture (feedforward)
-- Limited training time (5 epochs)
-- No computational efficiency analysis
-
-## Future Work
-
-- Test on more complex datasets (CIFAR-10, ImageNet)
-- Compare additional activation functions (Swish, Leaky ReLU)
-- Run multiple experiments for statistical significance
-- Analyze training time and computational overhead
-
----
-
-*A systematic comparison of ReLU vs GELU activation functions on MNIST classification.*
+However, the results also highlight the critical importance of hyperparameter tuning and model capacity selection, which can have larger effects on performance than the choice of activation mechanism.

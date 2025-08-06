@@ -1,0 +1,8 @@
+torch
+torchvision
+pytorch-lightning
+scikit-learn
+matplotlib
+numpy
+seaborn
+lightning
