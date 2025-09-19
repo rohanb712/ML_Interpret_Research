@@ -1,0 +1,15 @@
+[
+  {
+    "target_actives": 20,
+    "achieved_actives_val": 9.53,
+    "lambda": 0.006579332246575676,
+    "baseline_acc": 0.9413,
+    "recon_acc_jumprelu": 0.9344,
+    "recon_acc_boolean": 0.4834,
+    "delta_acc_jumprelu": 0.0069,
+    "delta_acc_boolean": 0.4579,
+    "sae_latents": 512,
+    "tau": 0.1,
+    "normalize_z": true
+  }
+]
