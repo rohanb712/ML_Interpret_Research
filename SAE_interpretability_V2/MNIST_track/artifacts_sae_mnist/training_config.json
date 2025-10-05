@@ -1,0 +1,12 @@
+{
+  "seed": 42,
+  "ffn_type": "ReLU",
+  "hidden_dim": 128,
+  "sae_latents": 32,
+  "tau": 0.1,
+  "init_theta": 0.5,
+  "target_actives": 1,
+  "achieved_actives": 1.6240832805633545,
+  "lambda": 0.09,
+  "baseline_acc": 0.9745
+}

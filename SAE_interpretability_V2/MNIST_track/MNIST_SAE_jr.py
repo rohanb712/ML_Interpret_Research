@@ -1,0 +1,1809 @@
+# Cell 0: Dependencies for local machine
+# 
+# INSTALLATION INSTRUCTIONS (run once in your terminal):
+# 
+# 1. Install PyTorch (with CUDA 12.1):
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+#    OR for CPU-only:
+#    pip install torch torchvision torchaudio
+#
+# 2. Install other dependencies:
+#    pip install -r requirements.txt
+#
+# 3. Install Tracr:
+#    pip install git+https://github.com/neelnanda-io/Tracr
+#
+# Then you can run this script directly!
+
+# Cell 1: Imports & constants
+import os, json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from torchvision import datasets, transforms
+import pytorch_lightning as pl
+
+SEED = 42
+pl.seed_everything(SEED, workers=True)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# FFN hyperparameters
+FFN_TYPE = "ReLU"
+HIDDEN_DIM = 128
+LR_FFN = 1e-3
+EPOCHS_FFN = 5
+BATCH_FFN = 8
+
+# SAE hyperparameters
+SAE_LATENTS      = 32
+TAU              = 0.1
+INIT_THETA       = 0.5
+LR_SAE_FINAL     = 1e-3
+EPOCHS_SAE_FINAL = 5
+BATCH_SAE        = 8
+NORMALIZE_Y      = True
+TARGET_ACTIVES   = [1, 2, 4]
+
+OUT_DIR = "artifacts_reversal_sae"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+def load_mnist(batch_size=BATCH_FFN):
+    tfm = transforms.Compose([transforms.ToTensor()])
+    ds_train_full = datasets.MNIST(root=".", train=True,  download=True, transform=tfm)
+    ds_test       = datasets.MNIST(root=".", train=False, download=True, transform=tfm)
+
+    train_len  = int(0.8 * len(ds_train_full))
+    val_len    = len(ds_train_full) - train_len
+    ds_train, ds_val = random_split(ds_train_full, [train_len, val_len], generator=torch.Generator().manual_seed(SEED))
+
+    pin = torch.cuda.is_available()
+    # num_workers=0 for Windows compatibility (avoids multiprocessing issues)
+    dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True,  num_workers=0, pin_memory=pin)
+    dl_val   = DataLoader(ds_val,   batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=pin)
+    dl_test  = DataLoader(ds_test,  batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=pin)
+    return dl_train, dl_val, dl_test
+
+dl_train, dl_val, dl_test = load_mnist()
+
+
+class FFN_GeGLU(nn.Module):
+    def __init__(self, d_i, d_h, d_o):
+        super().__init__()
+        self.W_in_ih   = nn.Parameter(torch.randn(d_i, d_h) * 0.02)
+        self.W_gate_ih = nn.Parameter(torch.randn(d_i, d_h) * 0.02)
+        self.W_out_ho  = nn.Parameter(torch.randn(d_h, d_o) * 0.02)
+    def forward(self, x_bi):  # x_bi: [batch, input]
+        x_proj_bh = torch.einsum('bi,ih->bh', x_bi, self.W_in_ih)
+        gate_bh   = F.gelu(torch.einsum('bi,ih->bh', x_bi, self.W_gate_ih))
+        h_bh = x_proj_bh * gate_bh
+        y_bo = torch.einsum('bh,ho->bo', h_bh, self.W_out_ho)  # logits
+        return y_bo
+
+class FFN_ReLU(nn.Module):
+    def __init__(self, d_i, d_h, d_o):
+        super().__init__()
+        self.W_in_ih  = nn.Parameter(torch.randn(d_i, d_h) * 0.02)
+        self.W_out_ho = nn.Parameter(torch.randn(d_h, d_o) * 0.02)
+    def forward(self, x_bi):
+        z_bh = torch.einsum('bi,ih->bh', x_bi, self.W_in_ih)
+        h_bh = F.relu(z_bh)
+        y_bo = torch.einsum('bh,ho->bo', h_bh, self.W_out_ho)  # logits
+        return y_bo
+
+class MNIST_FFN(pl.LightningModule):
+    def __init__(self, ffn_type="ReLU", d_h=128, lr=1e-3):
+        super().__init__()
+        self.save_hyperparameters()
+        d_i, d_o = 28*28, 10
+        if ffn_type == "GeGLU":
+            self.ffn = FFN_GeGLU(d_i, d_h, d_o)
+        elif ffn_type == "ReLU":
+            self.ffn = FFN_ReLU(d_i, d_h, d_o)
+        else:
+            raise ValueError("Invalid ffn_type")
+    def forward(self, x_bchw):
+        x_bi = x_bchw.view(x_bchw.size(0), -1)
+        y_bo = self.ffn(x_bi)
+        return y_bo
+    def training_step(self, batch, _):
+        x_bchw, y_gt = batch
+        y_bo = self(x_bchw)
+        return F.cross_entropy(y_bo, y_gt)
+    def validation_step(self, batch, _):
+        x_bchw, y_gt = batch
+        y_bo = self(x_bchw)
+        acc = (y_bo.argmax(dim=1) == y_gt).float().mean()
+        self.log("val_acc", acc, prog_bar=True)
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+def _trainer(max_epochs):
+    use_gpu = torch.cuda.is_available()
+    has_bf16 = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+    precision = "bf16-mixed" if (use_gpu and has_bf16) else (16 if use_gpu else 32)
+    return pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator="gpu" if use_gpu else "cpu",
+        devices=1,
+        precision=precision,
+        logger=False,
+        enable_checkpointing=False,
+    )
+
+model = MNIST_FFN(FFN_TYPE, HIDDEN_DIM, LR_FFN)
+_tr = _trainer(EPOCHS_FFN)
+_tr.fit(model, dl_train, dl_val)
+
+
+@torch.no_grad()
+def baseline_accuracy(model, loader):
+    model.eval().to(device)
+    correct=total=0
+    for x_bchw, y_gt in loader:
+        y_bo = model(x_bchw.to(device))
+        pred = y_bo.argmax(dim=1)
+        correct += (pred == y_gt.to(device)).sum().item()
+        total   += y_gt.numel()
+    return correct / max(total,1)
+
+base_test_acc = baseline_accuracy(model, dl_test)
+print(f"Baseline test accuracy: {base_test_acc:.4f}")
+
+
+@torch.no_grad()
+def collect_logits_buffers(model, loader):
+    model.eval().to(device)
+    feats = []
+    for x_bchw, _ in loader:
+        x_bi = x_bchw.to(device).view(x_bchw.size(0), -1)
+        y_bo = model.ffn(x_bi)
+        feats.append(y_bo.cpu())
+    return torch.cat(feats, dim=0)
+
+Ytr_bo = collect_logits_buffers(model, dl_train)
+Yva_bo = collect_logits_buffers(model, dl_val)
+Yte_bo = collect_logits_buffers(model, dl_test)
+print("Buffers (logits):", Ytr_bo.shape, Yva_bo.shape, Yte_bo.shape)
+
+if NORMALIZE_Y:
+    mu_bo  = Ytr_bo.mean(0, keepdim=True)
+    std_bo = Ytr_bo.std(0, keepdim=True).clamp_min(1e-6)
+    Ytr_n = (Ytr_bo - mu_bo) / std_bo
+    Yva_n = (Yva_bo - mu_bo) / std_bo
+    Yte_n = (Yte_bo - mu_bo) / std_bo
+else:
+    mu_bo, std_bo = 0.0, 1.0
+    Ytr_n, Yva_n, Yte_n = Ytr_bo, Yva_bo, Yte_bo
+
+
+class SAE_JumpReLU(pl.LightningModule):
+    def __init__(self, d_in, d_latents=32, lambda_l0=1e-2, lr=1e-3, init_theta=0.5, tau=0.1):
+        super().__init__()
+        self.save_hyperparameters()
+        self.enc = nn.Linear(d_in, d_latents, bias=True)
+        self.theta_h = nn.Parameter(torch.full((d_latents,), float(init_theta)))
+        self.tau   = tau
+        self.dec = nn.Linear(d_latents, d_in, bias=True)
+    def forward(self, y_bO):
+        u_bh = self.enc(y_bO)
+        soft_bh = torch.sigmoid((u_bh - self.theta_h) / self.tau)
+        hard_bh = (u_bh > self.theta_h).float()
+        gate_bh = (hard_bh - soft_bh).detach() + soft_bh
+        f_bh = u_bh * gate_bh
+        y_hat_bO = self.dec(f_bh)
+        return y_hat_bO, f_bh, u_bh, soft_bh, hard_bh
+    def _step(self, batch):
+        (y_bO,) = batch
+        y_hat_bO, f_bh, u_bh, soft_bh, hard_bh = self(y_bO)
+        recon = F.mse_loss(y_hat_bO, y_bO, reduction="mean")
+        l0_soft = soft_bh.sum(dim=1).mean()
+        loss = recon + self.hparams.lambda_l0 * l0_soft
+        l0_hard = hard_bh.sum(dim=1).float().mean().detach()
+        return loss, recon.detach(), l0_soft.detach(), l0_hard
+    def training_step(self, batch, _):
+        loss, recon, l0_soft, l0_hard = self._step(batch)
+        self.log_dict({"train/recon_mse": recon, "train/l0_soft": l0_soft, "train/l0_hard": l0_hard}, prog_bar=True)
+        return loss
+    def validation_step(self, batch, _):
+        loss, recon, l0_soft, l0_hard = self._step(batch)
+        self.log_dict({"val/recon_mse": recon, "val/l0_soft": l0_soft, "val/l0_hard": l0_hard}, prog_bar=True)
+    def on_after_backward(self):
+        with torch.no_grad():
+            W_hO = self.dec.weight.data
+            norms = W_hO.norm(dim=0, keepdim=True).clamp_min(1e-8)
+            self.dec.weight.data = W_hO / norms
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+def tloader(t, bs=BATCH_SAE, shuffle=True):
+    pin = torch.cuda.is_available()
+    return DataLoader(TensorDataset(t), batch_size=bs, shuffle=shuffle, num_workers=0, pin_memory=pin)
+
+@torch.no_grad()
+def gate_counts(sae, Y_bO, batch=1024):
+    sae.eval().to(device)
+    tots = []
+    for i in range(0, Y_bO.size(0), batch):
+        u_bh = sae.enc(Y_bO[i:i+batch].to(device))
+        hard_bh = (u_bh > sae.theta_h).float()
+        tots.append(hard_bh.sum(dim=1).cpu())
+    return float(torch.cat(tots).mean())
+
+def sae_forward_logits(sae, y_raw_bO, mu_bo, std_bo):
+    dev = y_raw_bO.device
+    sae.eval().to(dev)
+    mu_t  = mu_bo.to(dev)  if isinstance(mu_bo,  torch.Tensor) else mu_bo
+    std_t = std_bo.to(dev) if isinstance(std_bo, torch.Tensor) else std_bo
+    y_n_bO = (y_raw_bO - mu_t) / std_t if isinstance(mu_t, torch.Tensor) else y_raw_bO
+    y_hat_n_bO, *_ = sae(y_n_bO)
+    if isinstance(mu_t, torch.Tensor):
+        y_hat_bO = y_hat_n_bO * std_t + mu_t
+    else:
+        y_hat_bO = y_hat_n_bO
+    return y_hat_bO
+
+@torch.no_grad()
+def test_accuracy_with_sae_logits(model, loader, sae, mu_bo, std_bo):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval().to(dev); sae.eval().to(dev)
+    correct = total = 0
+    for x_bchw, y_gt in loader:
+        x_bi = x_bchw.to(dev).view(x_bchw.size(0), -1)
+        y_raw_bO = model.ffn(x_bi)
+        y_hat_bO = sae_forward_logits(sae, y_raw_bO, mu_bo, std_bo)
+        pred = y_hat_bO.argmax(dim=1)
+        correct += (pred == y_gt.to(dev)).sum().item()
+        total   += y_gt.numel()
+    return correct / max(total, 1)
+
+
+def _trainer_sae(max_epochs):
+    use_gpu = torch.cuda.is_available()
+    has_bf16 = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+    precision = "bf16-mixed" if (use_gpu and has_bf16) else (16 if use_gpu else 32)
+    return pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator="gpu" if use_gpu else "cpu",
+        devices=1,
+        precision=precision,
+        logger=False,
+        enable_checkpointing=False,
+    )
+
+def train_sae_once(d_in, lam, Ytr, Yva, epochs):
+    sae = SAE_JumpReLU(d_in=d_in, d_latents=SAE_LATENTS, lambda_l0=lam, lr=LR_SAE_FINAL, init_theta=INIT_THETA, tau=TAU)
+    tr = _trainer_sae(epochs)
+    tr.fit(sae, tloader(Ytr, shuffle=True), tloader(Yva, shuffle=False))
+    return sae
+
+def calibrate_lambda(Ytr, Yva, target_actives, coarse_grid=np.geomspace(1e-6, 1e-1, 10), refine_factor=3, refine_steps=5):
+    d_in = Ytr.shape[1]
+    best = None
+    for lam in coarse_grid:
+        sae = train_sae_once(d_in, float(lam), Ytr, Yva, epochs=1)
+        m_act = gate_counts(sae, Yva)
+        gap = abs(m_act - target_actives)
+        if (best is None) or (gap < best["gap"]):
+            best = {"lam": float(lam), "sae": sae, "m_act": float(m_act), "gap": float(gap)}
+    lam_star = best["lam"]
+    low = lam_star / (refine_factor**2)
+    high = lam_star * (refine_factor**2)
+    refine_grid = np.geomspace(max(low, 1e-8), min(high, 1.0), refine_steps)
+    for lam in refine_grid:
+        sae = train_sae_once(d_in, float(lam), Ytr, Yva, epochs=1)
+        m_act = gate_counts(sae, Yva)
+        gap = abs(m_act - target_actives)
+        if gap < best["gap"]:
+            best = {"lam": float(lam), "sae": sae, "m_act": float(m_act), "gap": float(gap)}
+    return best
+
+
+# device-safe overrides that work with both SAE variants (with .theta or .act.theta)
+def _get_theta(sae):
+    return sae.theta if hasattr(sae, "theta") else sae.act.theta
+
+def sae_forward_modes(sae, z_raw, mu, std, mode="jumprelu"):
+    dev = z_raw.device
+    sae.eval().to(dev)
+    mu_t  = mu.to(dev)  if isinstance(mu,  torch.Tensor) else mu
+    std_t = std.to(dev) if isinstance(std, torch.Tensor) else std
+    z = (z_raw - mu_t) / std_t if isinstance(mu_t, torch.Tensor) else z_raw
+
+    u = sae.enc(z)
+    theta = _get_theta(sae)
+    if mode == "jumprelu":
+        b = (u > theta).float()
+        f = u * b
+    elif mode == "boolean":
+        f = (u > theta).float()
+    else:
+        raise ValueError("mode must be 'jumprelu' or 'boolean'")
+
+    xh = sae.dec(f)
+    if isinstance(mu_t, torch.Tensor):
+        xh = xh * std_t + mu_t
+    return xh
+
+@torch.no_grad()
+def test_accuracy_with_mode(model, loader, ffn_type, sae, mu, std, mode="jumprelu"):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval().to(dev)
+    sae.eval().to(dev)
+
+    correct = total = 0
+    for xb, yb in loader:
+        xb, yb = xb.to(dev), yb.to(dev)
+        x_flat = xb.view(xb.size(0), -1)
+        z_raw  = torch.einsum('bi,ih->bh', x_flat, model.ffn.W_in)
+        z_hat  = sae_forward_modes(sae, z_raw, mu, std, mode=mode)
+
+        if ffn_type == "ReLU":
+            h = F.relu(z_hat)
+            logits = torch.einsum('bh,ho->bo', h, model.ffn.W_out)
+        else:
+            gate = F.gelu(torch.einsum('bi,ih->bh', x_flat, model.ffn.W_gate))
+            h = z_hat * gate
+            logits = torch.einsum('bh,ho->bo', h, model.ffn.W_out)
+        preds = logits.argmax(dim=1)
+        correct += (preds == yb).sum().item()
+        total   += yb.numel()
+    return correct / max(total, 1)
+
+
+# Cell 9 — robust & fast SAE run (fixes Cell 9 crash)
+# - Uses small subsets for calibration/final SAE
+# - Small lambda grid + few refine steps
+# - Try/except around long-running calls so interrupts don't explode the traceback
+
+# Speed knobs
+FAST_MODE = True
+CAL_SAMPLES_TRAIN = 8000 if FAST_MODE else len(Ytr_n)
+CAL_SAMPLES_VAL   = 2000 if FAST_MODE else len(Yva_n)
+COARSE_GRID       = np.geomspace(1e-5, 1e-2, 4)  # tiny grid
+REFINE_STEPS      = 3
+FINAL_EPOCHS      = min(EPOCHS_SAE_FINAL, 3) if FAST_MODE else EPOCHS_SAE_FINAL
+
+# Subsets for quick calibration/training
+Ytr_cal = Ytr_n[:CAL_SAMPLES_TRAIN].contiguous()
+Yva_cal = Yva_n[:CAL_SAMPLES_VAL].contiguous()
+print(f"Calibrate on train={len(Ytr_cal)}, val={len(Yva_cal)}; coarse_grid={COARSE_GRID}")
+
+results = []
+for target_k in TARGET_ACTIVES:
+    print(f"\n=== Calibrating for target actives ~{target_k} on LOGITS ===")
+    # --- Calibration ---
+    try:
+        pick = calibrate_lambda(
+            Ytr_cal, Yva_cal, target_k,
+            coarse_grid=COARSE_GRID,
+            refine_steps=REFINE_STEPS
+        )
+    except KeyboardInterrupt:
+        print("Calibration interrupted -- falling back to lambda=1e-3")
+        pick = {"lam": 1e-3, "m_act": float("nan")}
+    print(f"Picked lambda={pick['lam']:.2e}; achieved actives ~{pick.get('m_act', float('nan')):.2f} (cal)")
+
+    # --- Train final SAE ---
+    try:
+        sae_final = train_sae_once(Ytr_cal.shape[1], pick["lam"], Ytr_cal, Yva_cal, epochs=FINAL_EPOCHS)
+    except KeyboardInterrupt:
+        print("Final SAE training interrupted — stopping cleanly.")
+        raise  # re-raise so you can stop the run without a messy stacktrace
+
+    # Evaluate (use full val/test – cheap)
+    achieved_k   = gate_counts(sae_final, Yva_n)
+    acc_baseline = base_test_acc
+    acc_sae      = test_accuracy_with_sae_logits(model, dl_test, sae_final, mu_bo, std_bo)
+
+    row = {
+        "target_actives": target_k,
+        "achieved_actives_val": round(achieved_k, 2),
+        "lambda": pick["lam"],
+        "baseline_acc": round(acc_baseline, 4),
+        "recon_acc_logits": round(acc_sae, 4),
+        "delta_acc_logits": round(acc_baseline - acc_sae, 4),
+        "sae_latents": SAE_LATENTS,
+        "tau": TAU,
+        "normalize_logits": NORMALIZE_Y,
+        "batch_sizes": {"ffn": BATCH_FFN, "sae": BATCH_SAE},
+    }
+    results.append(row)
+    print(row)
+
+# Persist results
+with open(os.path.join(OUT_DIR, "summary.json"), "w") as f:
+    json.dump(results, f, indent=2)
+
+# Pick & write the "best" row
+best = min(results, key=lambda r: (abs(r["target_actives"]-1), r["delta_acc_logits"]))
+best_md = (
+    "# Best Result (Auto)\n"
+    f"- target_actives: {best['target_actives']}\n"
+    f"- achieved_actives_val: {best['achieved_actives_val']}\n"
+    f"- lambda: {best['lambda']:.3e}\n"
+    f"- baseline_acc: {best['baseline_acc']:.4f}\n"
+    f"- recon_acc_logits: {best['recon_acc_logits']:.4f}\n"
+    f"- delta_acc_logits: {best['delta_acc_logits']:.4f}\n"
+    f"- sae_latents: {best['sae_latents']}\n"
+    f"- tau: {best['tau']}\n"
+    f"- normalize_logits: {best['normalize_logits']}\n"
+    f"- batch_sizes: FFN={best['batch_sizes']['ffn']}, SAE={best['batch_sizes']['sae']}\n"
+)
+with open(os.path.join(OUT_DIR, "BEST_RESULTS.md"), "w") as f:
+    f.write(best_md)
+
+print("\nWrote:", os.path.join(OUT_DIR, "summary.json"))
+print("Wrote:", os.path.join(OUT_DIR, "BEST_RESULTS.md"))
+
+
+best_path = os.path.join(OUT_DIR, "BEST_RESULTS.md")
+if os.path.exists(best_path):
+    with open(best_path, "r") as f:
+        print(f.read())
+else:
+    print("Run Cell 9 first to generate BEST_RESULTS.md")
+
+
+# Cell 12 — Consistent reconstruction-MSE evaluators (normalized vs unnormalized)
+
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def sae_forward_recon(sae, z_raw, mu=None, std=None, mode="jumprelu"):
+    """
+    Returns:
+      z_hat_norm  : reconstruction in the *normalized* SAE space
+      z_recon_raw : reconstruction mapped back to *raw* (unnormalized) space (if mu/std given)
+    """
+    dev = next(sae.parameters()).device
+    z_raw = z_raw.to(dev)
+
+    # normalize to the space used during SAE training
+    if (isinstance(mu, torch.Tensor) and isinstance(std, torch.Tensor)):
+        mu_t  = mu.to(dev)
+        std_t = std.to(dev)
+        z = (z_raw - mu_t) / (std_t + 1e-8)
+    else:
+        mu_t = std_t = None
+        z = z_raw
+
+    u = sae.enc(z)
+
+    # --- SAFE theta retrieval (no tensor truthiness) ---
+    theta = None
+    if hasattr(sae, "theta_h"):
+        theta = getattr(sae, "theta_h")
+    elif hasattr(sae, "theta"):
+        theta = getattr(sae, "theta")
+    if isinstance(theta, torch.nn.Parameter):
+        theta = theta.data
+    if theta is None:
+        theta = torch.tensor(0.0, device=dev, dtype=u.dtype)
+    else:
+        theta = theta.to(device=dev, dtype=u.dtype)
+    # ---------------------------------------------------
+
+    if mode == "jumprelu":
+        b = (u > theta).to(u.dtype)
+        f = u * b
+    elif mode == "boolean":
+        f = (u > theta).to(u.dtype)
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    z_hat_norm = sae.dec(f)  # normalized space
+
+    if (mu_t is not None) and (std_t is not None):
+        z_recon_raw = z_hat_norm * (std_t + 1e-8) + mu_t
+    else:
+        z_recon_raw = z_hat_norm
+
+    return z_hat_norm, z_recon_raw
+
+
+@torch.no_grad()
+def mse_over_loader(sae, loader, mu=None, std=None, mode="jumprelu", compare_space="normalized"):
+    """
+    compare_space: "normalized"  -> MSE between z_hat_norm and z_norm   (matches SAE training logs)
+                   "raw"         -> MSE between z_recon_raw and z_raw   (user-facing, intuitive)
+    Returns scalar mean MSE over all examples and dimensions.
+    """
+    sae.eval()
+    dev = next(sae.parameters()).device
+    total_sqerr, total_count = 0.0, 0
+
+    for batch in loader:
+        # accept (tensor,) or tensor
+        z_raw = batch[0] if isinstance(batch, (list, tuple)) else batch
+        z_raw = z_raw.to(dev)
+
+        # forward
+        z_hat_norm, z_recon_raw = sae_forward_recon(sae, z_raw, mu=mu, std=std, mode=mode)
+
+        if compare_space == "normalized":
+            if (isinstance(mu, torch.Tensor) and isinstance(std, torch.Tensor)):
+                z_norm = (z_raw - mu.to(dev)) / (std.to(dev) + 1e-8)
+            else:
+                z_norm = z_raw
+            diff = z_hat_norm - z_norm
+        elif compare_space == "raw":
+            diff = z_recon_raw - z_raw
+        else:
+            raise ValueError("compare_space must be 'normalized' or 'raw'")
+
+        total_sqerr += diff.pow(2).sum().item()
+        total_count += diff.numel()
+
+    return total_sqerr / max(total_count, 1)
+
+
+# Cell 13 — Compute train/val/test MSE in normalized space (matches training logs) and raw space
+
+# Reuse your existing hidden-activation tensors & loaders (the same reps you trained the SAE on):
+# Assuming you already have Ytr_bo, Yva_bo, Yte_bo and mu_bo, std_bo, sae_final
+train_loader = tloader(Ytr_bo, bs=256, shuffle=False)
+val_loader   = tloader(Yva_bo, bs=256, shuffle=False)
+test_loader  = tloader(Yte_bo, bs=256, shuffle=False)
+
+# 1) Normalized-space MSE (should be close to Lightning's train/val recon_mse ~ 0.2)
+tr_mse_norm = mse_over_loader(sae_final, train_loader, mu=mu_bo, std=std_bo, compare_space="normalized")
+va_mse_norm = mse_over_loader(sae_final, val_loader,   mu=mu_bo, std=std_bo, compare_space="normalized")
+te_mse_norm = mse_over_loader(sae_final, test_loader,  mu=mu_bo, std=std_bo, compare_space="normalized")
+
+# 2) Raw-space MSE (often larger because it includes the original scale)
+tr_mse_raw = mse_over_loader(sae_final, train_loader, mu=mu_bo, std=std_bo, compare_space="raw")
+va_mse_raw = mse_over_loader(sae_final, val_loader,   mu=mu_bo, std=std_bo, compare_space="raw")
+te_mse_raw = mse_over_loader(sae_final, test_loader,  mu=mu_bo, std=std_bo, compare_space="raw")
+
+print(f"[Recon MSE — normalized space] train={tr_mse_norm:.6f} | val={va_mse_norm:.6f} | test={te_mse_norm:.6f}")
+print(f"[Recon MSE — raw space]        train={tr_mse_raw:.6f}  | val={va_mse_raw:.6f}  | test={te_mse_raw:.6f}")
+
+
+# Cell 14 — Optional: per-example MSE distribution and best/worst examples (on validation set)
+
+import torch
+
+@torch.no_grad()
+def per_example_mse(sae, Z_raw, mu=None, std=None, mode="jumprelu", compare_space="normalized", batch_size=512):
+    dev = next(sae.parameters()).device
+    sae.eval()
+    N = Z_raw.shape[0]
+    out = torch.empty(N, device="cpu")
+    for i in range(0, N, batch_size):
+        z_batch = Z_raw[i:i+batch_size].to(dev)
+        z_hat_norm, z_recon_raw = sae_forward_recon(sae, z_batch, mu=mu, std=std, mode=mode)
+        if compare_space == "normalized":
+            z_norm = (z_batch - mu.to(dev)) / (std.to(dev) + 1e-8) if (isinstance(mu, torch.Tensor) and isinstance(std, torch.Tensor)) else z_batch
+            diff = z_hat_norm - z_norm
+        else:
+            diff = z_recon_raw - z_batch
+        out[i:i+batch_size] = diff.pow(2).mean(dim=1).detach().cpu()
+    return out  # (N,)
+
+# Compute per-example val MSE in normalized space
+val_per_ex_mse = per_example_mse(sae_final, Yva_bo, mu=mu_bo, std=std_bo, compare_space="normalized")
+val_avg = val_per_ex_mse.mean().item()
+val_med = val_per_ex_mse.median().item()
+val_p95 = val_per_ex_mse.quantile(0.95).item()
+best_idx = int(torch.argmin(val_per_ex_mse))
+worst_idx = int(torch.argmax(val_per_ex_mse))
+
+print(f"[Val per-example MSE — normalized] mean={val_avg:.6f} | median={val_med:.6f} | p95={val_p95:.6f}")
+print(f"Best example idx={best_idx} mse={val_per_ex_mse[best_idx].item():.6f}")
+print(f"Worst example idx={worst_idx} mse={val_per_ex_mse[worst_idx].item():.6f}")
+
+
+# Cell 15 — CE/accuracy helpers that work with your loaders and model
+
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def ce_and_acc_over_img_loader(model, loader, device=None):
+    dev = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    model.eval().to(dev)
+    ce_sum, correct, seen = 0.0, 0, 0
+    for x_bchw, y_gt in loader:
+        x_bchw = x_bchw.to(dev)
+        y_gt   = y_gt.to(dev).long()
+        logits = model(x_bchw)                # baseline logits
+        ce_sum += F.cross_entropy(logits, y_gt, reduction="sum").item()
+        correct += (logits.argmax(dim=1) == y_gt).sum().item()
+        seen += y_gt.numel()
+    return ce_sum / max(seen, 1), correct / max(seen, 1)
+
+@torch.no_grad()
+def ce_and_acc_over_img_loader_with_sae(model, loader, sae, mu_bo, std_bo, device=None):
+    dev = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    model.eval().to(dev); sae.eval().to(dev)
+    ce_sum, correct, seen = 0.0, 0, 0
+    for x_bchw, y_gt in loader:
+        x_bchw = x_bchw.to(dev)
+        y_gt   = y_gt.to(dev).long()
+        # your pipeline: x -> MLP.ffn logits -> SAE -> recon logits
+        x_bi      = x_bchw.view(x_bchw.size(0), -1)
+        y_raw_bO  = model.ffn(x_bi)
+        y_hat_bO  = sae_forward_logits(sae, y_raw_bO, mu_bo, std_bo)  # already returns RAW-space recon logits
+        ce_sum   += F.cross_entropy(y_hat_bO, y_gt, reduction="sum").item()
+        correct  += (y_hat_bO.argmax(dim=1) == y_gt).sum().item()
+        seen     += y_gt.numel()
+    return ce_sum / max(seen, 1), correct / max(seen, 1)
+
+
+# Cell 16 — Compute CE/Acc for baseline vs SAE on all splits
+
+# Baseline (no SAE)
+tr_ce_base, tr_acc_base = ce_and_acc_over_img_loader(model, dl_train, device=device)
+va_ce_base, va_acc_base = ce_and_acc_over_img_loader(model, dl_val,   device=device)
+te_ce_base, te_acc_base = ce_and_acc_over_img_loader(model, dl_test,  device=device)
+
+# With SAE-reconstructed logits
+tr_ce_sae, tr_acc_sae = ce_and_acc_over_img_loader_with_sae(model, dl_train, sae_final, mu_bo, std_bo, device=device)
+va_ce_sae, va_acc_sae = ce_and_acc_over_img_loader_with_sae(model, dl_val,   sae_final, mu_bo, std_bo, device=device)
+te_ce_sae, te_acc_sae = ce_and_acc_over_img_loader_with_sae(model, dl_test,  sae_final, mu_bo, std_bo, device=device)
+
+print("=== Cross-Entropy (↓) / Accuracy (↑) ===")
+print(f"TRAIN | CE base {tr_ce_base:.4f} | CE SAE {tr_ce_sae:.4f} | ΔCE {tr_ce_sae - tr_ce_base:+.4f} | Acc base {tr_acc_base:.4f} | Acc SAE {tr_acc_sae:.4f} | ΔAcc {tr_acc_sae - tr_acc_base:+.4f}")
+print(f"VAL   | CE base {va_ce_base:.4f} | CE SAE {va_ce_sae:.4f} | ΔCE {va_ce_sae - va_ce_base:+.4f} | Acc base {va_acc_base:.4f} | Acc SAE {va_acc_sae:.4f} | ΔAcc {va_acc_sae - va_acc_base:+.4f}")
+print(f"TEST  | CE base {te_ce_base:.4f} | CE SAE {te_ce_sae:.4f} | ΔCE {te_ce_sae - te_ce_base:+.4f} | Acc base {te_acc_base:.4f} | Acc SAE {te_acc_sae:.4f} | ΔAcc {te_acc_sae - te_acc_base:+.4f}")
+
+
+# Cell 17 — MLP sweep: configs + train/eval helper
+
+from copy import deepcopy
+import itertools, json, os
+from pathlib import Path
+
+SWEEP_HIDDEN = [1024, 8192]
+SWEEP_LR     = [1e-1, 1e-2, 1e-3, 1e-4]
+SWEEP_EPOCHS = EPOCHS_FFN            # keep same epochs; bump if you want even lower CE
+
+assert BATCH_FFN == 8, f"BATCH_FFN is {BATCH_FFN}, mentor requested bs=8. Recreate loaders with batch_size=8."
+# (Recreate anyway to be safe)
+dl_train, dl_val, dl_test = load_mnist(batch_size=8)
+
+SWEEP_DIR = Path(OUT_DIR) / "ffn_sweep"
+SWEEP_DIR.mkdir(parents=True, exist_ok=True)
+
+@torch.no_grad()
+def _acc_over_loader(model, loader, device=None):
+    dev = device or next(model.parameters()).device
+    model.eval().to(dev)
+    correct=total=0
+    for x_bchw, y_gt in loader:
+        y_bo = model(x_bchw.to(dev))
+        pred = y_bo.argmax(dim=1)
+        correct += (pred == y_gt.to(dev)).sum().item()
+        total   += y_gt.numel()
+    return correct / max(total,1)
+
+def train_eval_ffn(d_h, lr, epochs=SWEEP_EPOCHS, ffn_type=FFN_TYPE):
+    # fresh model for each run
+    m = MNIST_FFN(ffn_type, d_h=d_h, lr=lr)
+    tr = _trainer(epochs)
+    tr.fit(m, dl_train, dl_val)
+
+    # CE/Acc on splits
+    tr_ce, tr_acc = ce_and_acc_over_img_loader(m, dl_train, device=device)
+    va_ce, va_acc = ce_and_acc_over_img_loader(m, dl_val,   device=device)
+    te_ce, te_acc = ce_and_acc_over_img_loader(m, dl_test,  device=device)
+
+    # also baseline test acc via your original helper (just for parity)
+    te_acc2 = _acc_over_loader(m, dl_test, device=device)
+
+    return {
+        "hidden_dim": d_h,
+        "lr": lr,
+        "epochs": epochs,
+        "train_ce": tr_ce, "train_acc": tr_acc,
+        "val_ce": va_ce,   "val_acc": va_acc,
+        "test_ce": te_ce,  "test_acc": te_acc,
+        "test_acc_alt": te_acc2,
+        "ffn_type": ffn_type,
+    }, m
+
+
+# Cell 18 — Execute sweep and pick best by lowest validation CE
+
+def _lr_tag(x):  # safe filename tag for LRs
+    s = f"{x:.0e}".replace("+", "").replace("-", "m")
+    return s
+
+sweep_results = []
+best = None
+best_model = None
+
+print("=== MLP Sweep (bs=8) ===")
+for d_h, lr in itertools.product(SWEEP_HIDDEN, SWEEP_LR):
+    tag = f"d{d_h}_lr{_lr_tag(lr)}"
+    print(f"\n-> Training MLP: hidden={d_h}, lr={lr} ({tag})")
+    res, m = train_eval_ffn(d_h, lr)
+
+    # save checkpoint & metrics
+    ckpt_path = SWEEP_DIR / f"ffn_{tag}.pt"
+    torch.save(m.state_dict(), ckpt_path)
+    res["ckpt"] = str(ckpt_path)
+    sweep_results.append(res)
+
+    # print row
+    print(f"   Train CE {res['train_ce']:.4f} | Val CE {res['val_ce']:.4f} | Test CE {res['test_ce']:.4f}")
+    print(f"   Train Acc {res['train_acc']:.4f} | Val Acc {res['val_acc']:.4f} | Test Acc {res['test_acc']:.4f}")
+
+    # track best by lowest val CE
+    if (best is None) or (res["val_ce"] < best["val_ce"]):
+        best = deepcopy(res)
+        best_model = deepcopy(m)  # keep in-memory copy of best
+
+# Save summary
+sum_path = SWEEP_DIR / "summary_ffn_sweep.json"
+with open(sum_path, "w") as f:
+    json.dump(sweep_results, f, indent=2)
+
+print("\n=== Sweep complete ===")
+print(f"Saved summary: {sum_path}")
+print("Top-3 by Val CE:")
+top3 = sorted(sweep_results, key=lambda r: r["val_ce"])[:3]
+for i, r in enumerate(top3, 1):
+    print(f"{i}) d={r['hidden_dim']:<5} lr={r['lr']:<8} | Val CE={r['val_ce']:.4f} | Val Acc={r['val_acc']:.4f} | ckpt={Path(r['ckpt']).name}")
+
+print("\nBest (Val CE):")
+print(best)
+best_ckpt = best["ckpt"]
+
+
+# Cell 19 — Transcoder config (fixed hidden dim = 1024)
+HIDDEN_DIM_TX = 1024
+BATCH_TX      = 8
+EPOCHS_TX_MLP = 3
+LR_TX_MLP     = 1e-3
+
+TX_LR     = 1e-3
+TX_WD     = 1e-4
+TX_EPOCHS = 5
+TX_BS     = 256
+
+TX_DIR = os.path.join(OUT_DIR, "transcoder_1024")
+os.makedirs(TX_DIR, exist_ok=True)
+
+dl_train_tx, dl_val_tx, dl_test_tx = load_mnist(batch_size=BATCH_TX)
+
+
+# Cell 20 — Train two 1024-wide MLPs A and B
+def train_ffn_with_seed(seed, ffn_type="ReLU", hidden=HIDDEN_DIM_TX, lr=LR_TX_MLP, epochs=EPOCHS_TX_MLP):
+    pl.seed_everything(seed, workers=True)
+    m = MNIST_FFN(ffn_type=ffn_type, d_h=hidden, lr=lr)
+    tr = _trainer(epochs)
+    tr.fit(m, dl_train_tx, dl_val_tx)
+    return m
+
+modelA = train_ffn_with_seed(123, hidden=HIDDEN_DIM_TX)
+modelB = train_ffn_with_seed(456, hidden=HIDDEN_DIM_TX)
+
+@torch.no_grad()
+def ce_acc(model, loader):
+    ce, acc = ce_and_acc_over_img_loader(model, loader, device=device)
+    return ce, acc
+
+print("Model A 1024 | Val CE/Acc:", ce_acc(modelA, dl_val_tx))
+print("Model B 1024 | Val CE/Acc:", ce_acc(modelB, dl_val_tx))
+
+
+# Cell 21 — Collect hidden preactivations z = x W_in for A and B
+@torch.no_grad()
+def collect_preacts(model, loader):
+    model.eval().to(device)
+    Z = []
+    for xb, _ in loader:
+        xb = xb.to(device)
+        x_flat = xb.view(xb.size(0), -1)
+        z = torch.einsum('bi,ih->bh', x_flat, model.ffn.W_in_ih)
+        Z.append(z.cpu())
+    return torch.cat(Z, dim=0)
+
+ZA_tr, ZB_tr = collect_preacts(modelA, dl_train_tx), collect_preacts(modelB, dl_train_tx)
+ZA_va, ZB_va = collect_preacts(modelA, dl_val_tx),   collect_preacts(modelB, dl_val_tx)
+ZA_te, ZB_te = collect_preacts(modelA, dl_test_tx),  collect_preacts(modelB, dl_test_tx)
+print("Train shapes:", ZA_tr.shape, ZB_tr.shape)
+
+
+# Cell 22 — Standardize A and B spaces and build z loaders
+muA, stdA = ZA_tr.mean(0, keepdim=True), ZA_tr.std(0, keepdim=True).clamp_min(1e-6)
+muB, stdB = ZB_tr.mean(0, keepdim=True), ZB_tr.std(0, keepdim=True).clamp_min(1e-6)
+
+def znorm(Z, mu, std): return (Z - mu) / std
+ZA_tr_n, ZB_tr_n = znorm(ZA_tr, muA, stdA), znorm(ZB_tr, muB, stdB)
+ZA_va_n, ZB_va_n = znorm(ZA_va, muA, stdA), znorm(ZB_va, muB, stdB)
+ZA_te_n, ZB_te_n = znorm(ZA_te, muA, stdA), znorm(ZB_te, muB, stdB)
+
+def zloader(ZA, ZB, bs=TX_BS, shuffle=True):
+    return DataLoader(TensorDataset(ZA, ZB), batch_size=bs, shuffle=shuffle,
+                      num_workers=0, pin_memory=torch.cuda.is_available())
+
+dl_z_tr = zloader(ZA_tr_n, ZB_tr_n, bs=TX_BS, shuffle=True)
+dl_z_va = zloader(ZA_va_n, ZB_va_n, bs=TX_BS, shuffle=False)
+dl_z_te = zloader(ZA_te_n, ZB_te_n, bs=TX_BS, shuffle=False)
+
+
+# Cell 23 — Train linear transcoder T: A→B in normalized space
+class Transcoder(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.lin = nn.Linear(d, d, bias=True)
+        nn.init.zeros_(self.lin.bias)
+    def forward(self, zA_n):
+        return self.lin(zA_n)
+
+def train_transcoder(d, dl_train, dl_val, lr=TX_LR, wd=TX_WD, epochs=TX_EPOCHS):
+    T = Transcoder(d).to(device)
+    opt = torch.optim.Adam(T.parameters(), lr=lr, weight_decay=wd)
+    best_va = float('inf'); best = None
+    for ep in range(1, epochs+1):
+        T.train(); tr_loss=0.0; n=0
+        for a_n, b_n in dl_train:
+            a_n, b_n = a_n.to(device), b_n.to(device)
+            loss = F.mse_loss(T(a_n), b_n)
+            opt.zero_grad(); loss.backward(); opt.step()
+            tr_loss += loss.item()*a_n.size(0); n += a_n.size(0)
+        tr_loss /= max(n,1)
+        T.eval(); va_loss=0.0; n=0
+        with torch.no_grad():
+            for a_n, b_n in dl_val:
+                a_n, b_n = a_n.to(device), b_n.to(device)
+                va_loss += F.mse_loss(T(a_n), b_n).item()*a_n.size(0); n += a_n.size(0)
+        va_loss /= max(n,1)
+        print(f"Transcoder ep {ep}/{epochs} | train MSE {tr_loss:.6f} | val MSE {va_loss:.6f}")
+        if va_loss < best_va:
+            best_va = va_loss
+            best = {k:v.detach().cpu().clone() for k,v in T.state_dict().items()}
+    if best is not None: T.load_state_dict(best)
+    return T, best_va
+
+D = HIDDEN_DIM_TX
+T_AB, best_va_mse = train_transcoder(D, dl_z_tr, dl_z_va)
+torch.save({"state_dict": T_AB.state_dict(), "muA": muA, "stdA": stdA, "muB": muB, "stdB": stdB},
+           os.path.join(TX_DIR, "transcoder_A_to_B.pt"))
+print("Saved:", os.path.join(TX_DIR, "transcoder_A_to_B.pt"))
+
+
+# Cell 24 — Evaluate transcoder MSE in normalized and raw spaces
+@torch.no_grad()
+def transcoder_mse(T, ZA, ZB, muA, stdA, muB, stdB, batch=2048):
+    T.eval().to(device)
+    total_n=total_r=0.0; count=0
+    for i in range(0, ZA.size(0), batch):
+        a, b = ZA[i:i+batch].to(device), ZB[i:i+batch].to(device)
+        a_n = (a - muA.to(device)) / (stdA.to(device) + 1e-8)
+        b_n = (b - muB.to(device)) / (stdB.to(device) + 1e-8)
+        b_hat_n = T(a_n)
+        diff_n = b_hat_n - b_n
+        mse_n  = diff_n.pow(2).mean().item()
+        b_hat  = b_hat_n * (stdB.to(device) + 1e-8) + muB.to(device)
+        diff_r = b_hat - b
+        mse_r  = diff_r.pow(2).mean().item()
+        total_n += mse_n * diff_n.numel()
+        total_r += mse_r * diff_r.numel()
+        count   += diff_n.numel()
+    return total_n/count, total_r/count
+
+va_mse_n, va_mse_r = transcoder_mse(T_AB, ZA_va, ZB_va, muA, stdA, muB, stdB)
+te_mse_n, te_mse_r = transcoder_mse(T_AB, ZA_te, ZB_te, muA, stdA, muB, stdB)
+print(f"Transcoder MSE normalized | val {va_mse_n:.6f} | test {te_mse_n:.6f}")
+print(f"Transcoder MSE raw        | val {va_mse_r:.6f} | test {te_mse_r:.6f}")
+
+
+# Cell 25 — Functional test: substitute T(A) into B and score CE and Acc
+@torch.no_grad()
+def ce_acc_B_with_transcoder(A, B, T, loader, muA, stdA, muB, stdB):
+    A.eval().to(device); B.eval().to(device); T.eval().to(device)
+    ce_sum=0.0; correct=0; seen=0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device).long()
+        x_flat = xb.view(xb.size(0), -1)
+        zA = torch.einsum('bi,ih->bh', x_flat, A.ffn.W_in_ih)
+        zA_n = (zA - muA.to(device)) / (stdA.to(device) + 1e-8)
+        zB_hat_n = T(zA_n)
+        zB_hat = zB_hat_n * (stdB.to(device) + 1e-8) + muB.to(device)
+        hB = F.relu(zB_hat)
+        logits_hat = torch.einsum('bh,ho->bo', hB, B.ffn.W_out_ho)
+        ce_sum += F.cross_entropy(logits_hat, yb, reduction="sum").item()
+        correct += (logits_hat.argmax(dim=1) == yb).sum().item()
+        seen += yb.numel()
+    return ce_sum / max(seen,1), correct / max(seen,1)
+
+ceB_val, accB_val = ce_acc(modelB, dl_val_tx)
+ceB_te,  accB_te  = ce_acc(modelB, dl_test_tx)
+ceTX_val, accTX_val = ce_acc_B_with_transcoder(modelA, modelB, T_AB, dl_val_tx, muA, stdA, muB, stdB)
+ceTX_te,  accTX_te  = ce_acc_B_with_transcoder(modelA, modelB, T_AB, dl_test_tx, muA, stdA, muB, stdB)
+
+print("Functional fidelity T(A)→B")
+print(f"VAL  | CE base {ceB_val:.4f} | CE T {ceTX_val:.4f} | ΔCE {ceTX_val - ceB_val:+.4f} | Acc base {accB_val:.4f} | Acc T {accTX_val:.4f} | ΔAcc {accTX_val - accB_val:+.4f}")
+print(f"TEST | CE base {ceB_te:.4f}  | CE T {ceTX_te:.4f}  | ΔCE {ceTX_te - ceB_te:+.4f}  | Acc base {accB_te:.4f}  | Acc T {accTX_te:.4f}  | ΔAcc {accTX_te - accB_te:+.4f}")
+
+
+# Cell 26 — Collect input x and target logits h from *the same MLP* (modelA)
+
+NORMALIZE_TX = True         # standardize targets per-dim (recommended)
+TX_LATENTS   = 128          # latent width for sparse T(x) -> h
+TX_TAU       = 0.1          # STE temperature
+TX_INIT_TH   = 0.5          # init threshold
+TX_LAMBDA    = 1e-2         # L0 (soft) weight
+TX_LR        = 1e-3
+TX_EPOCHS    = 5
+TX_BS        = 256
+
+assert 'modelA' in globals(), "modelA (1024-wide MLP) not found. Train it first with your Cell 20."
+
+@torch.no_grad()
+def collect_x_and_logits(model, loader):
+    model.eval().to(device)
+    X_list, H_list = [], []
+    for xb, _ in loader:
+        xb = xb.to(device)
+        # x_flat in [0,1], shape [B, 784]
+        x_flat = xb.view(xb.size(0), -1)
+        # h = logits = W_out @ ReLU(W_in @ x)
+        h = model(xb)  # logits (pre-softmax)
+        X_list.append(x_flat.cpu())
+        H_list.append(h.cpu())
+    return torch.cat(X_list, 0), torch.cat(H_list, 0)
+
+Xtr, Htr = collect_x_and_logits(modelA, dl_train_tx)
+Xva, Hva = collect_x_and_logits(modelA, dl_val_tx)
+Xte, Hte = collect_x_and_logits(modelA, dl_test_tx)
+print("Shapes — X:", Xtr.shape, Xva.shape, Xte.shape, "  H:", Htr.shape, Hva.shape, Hte.shape)
+
+# Standardize targets (logits) per-dimension; inputs x are already in [0,1]
+if NORMALIZE_TX:
+    mu_h  = Htr.mean(0, keepdim=True)
+    std_h = Htr.std(0, keepdim=True).clamp_min(1e-6)
+    Htr_n = (Htr - mu_h) / std_h
+    Hva_n = (Hva - mu_h) / std_h
+    Hte_n = (Hte - mu_h) / std_h
+else:
+    mu_h, std_h = None, None
+    Htr_n, Hva_n, Hte_n = Htr, Hva, Hte
+
+def loader_xh(X, H, bs=TX_BS, shuffle=True):
+    pin = torch.cuda.is_available()
+    return DataLoader(TensorDataset(X, H), batch_size=bs, shuffle=shuffle, num_workers=0, pin_memory=pin)
+
+dl_tx_tr = loader_xh(Xtr, Htr_n, bs=TX_BS, shuffle=True)
+dl_tx_va = loader_xh(Xva, Hva_n, bs=TX_BS, shuffle=False)
+dl_tx_te = loader_xh(Xte, Hte_n, bs=TX_BS, shuffle=False)
+
+
+# Cell 27 — JumpReLU Transcoder: x->[latent]->h (logits), with L0 via hard gate count
+
+class TranscoderJumpReLU(pl.LightningModule):
+    def __init__(self, d_in=28*28, d_lat=TX_LATENTS, d_out=10,
+                 tau=TX_TAU, init_theta=TX_INIT_TH, lambda_l0=TX_LAMBDA, lr=TX_LR):
+        super().__init__()
+        self.save_hyperparameters()
+        self.enc = nn.Linear(d_in, d_lat, bias=True)
+        self.theta_h = nn.Parameter(torch.full((d_lat,), float(init_theta)))
+        self.dec = nn.Linear(d_lat, d_out, bias=True)
+        self.tau = tau
+
+    def forward(self, x):
+        u = self.enc(x)                                         # pre-gate
+        soft = torch.sigmoid((u - self.theta_h) / self.tau)     # surrogate
+        hard = (u > self.theta_h).float()                       # hard gate
+        gate = (hard - soft).detach() + soft                    # STE
+        f = u * gate                                            # sparse latents
+        h_hat = self.dec(f)                                     # predict logits (normalized space if we trained on normalized)
+        return h_hat, f, u, soft, hard
+
+    def _step(self, batch):
+        x, h_tgt = batch
+        h_hat, f, u, soft, hard = self(x)
+        recon = F.mse_loss(h_hat, h_tgt, reduction="mean")
+        l0_soft = soft.sum(dim=1).mean()
+        loss = recon + self.hparams.lambda_l0 * l0_soft
+        l0_hard = hard.sum(dim=1).float().mean().detach()
+        logs = {"recon_mse": recon.detach(), "l0_soft": l0_soft.detach(), "l0_hard": l0_hard}
+        return loss, logs
+
+    def training_step(self, batch, _):
+        loss, logs = self._step(batch)
+        self.log_dict({f"train/{k}": v for k,v in logs.items()}, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, _):
+        _, logs = self._step(batch)
+        self.log_dict({f"val/{k}": v for k,v in logs.items()}, prog_bar=True)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+def train_transcoder_x_to_h():
+    T = TranscoderJumpReLU(d_in=28*28, d_lat=TX_LATENTS, d_out=10)
+    tr = _trainer(TX_EPOCHS)
+    tr.fit(T, dl_tx_tr, dl_tx_va)
+    return T
+
+T_xh = train_transcoder_x_to_h()
+
+
+# Task: Implement a transcoder model that takes the input `x` of a given MLP and predicts the hidden pre-activations `h` of that MLP.
+# The implementation should include reconstruction error (MSE) and L0 sparsity regularization.
+# Modify the existing code cells to reflect this new transcoder definition and training process.
+
+# ## Modify data loading for transcoder
+
+# ### Subtask:
+# Update the data loading to provide pairs of original input `x` and hidden pre-activations `h` from a single trained MLP.
+
+# **Reasoning**:
+# The subtask requires collecting pairs of input images and hidden pre-activations from a single MLP.
+# The new function `collect_input_preacts` is needed to achieve this, and then it will be called for the train,
+# validation, and test sets using `modelA` and the corresponding data loaders. Finally, the shapes will be printed to verify the output.
+
+
+
+# Cell 28 — Report reconstruction error (MSE) and L0
+
+@torch.no_grad()
+def mse_split(T, X, H, mu_h=None, std_h=None, bs=1024):
+    T.eval().to(device)
+    total_n = total_r = 0.0
+    cnt_n = cnt_r = 0
+    for i in range(0, X.size(0), bs):
+        x = X[i:i+bs].to(device)
+        h_raw = H[i:i+bs].to(device)
+        # normalized targets used in training
+        h_tgt_n = (h_raw - mu_h.to(device)) / (std_h.to(device) + 1e-8) if (mu_h is not None) else h_raw
+        h_hat_n, *_ = T(x.to(device))
+        # normalized MSE
+        diff_n = h_hat_n - h_tgt_n
+        total_n += diff_n.pow(2).sum().item()
+        cnt_n   += diff_n.numel()
+        # raw MSE (map prediction back if normalized training)
+        if mu_h is not None:
+            h_hat_raw = h_hat_n * (std_h.to(device) + 1e-8) + mu_h.to(device)
+        else:
+            h_hat_raw = h_hat_n
+        diff_r = h_hat_raw - h_raw
+        total_r += diff_r.pow(2).sum().item()
+        cnt_r   += diff_r.numel()
+    return total_n/max(cnt_n,1), total_r/max(cnt_r,1)
+
+tr_mse_n, tr_mse_r = mse_split(T_xh, Xtr, Htr, mu_h, std_h)
+va_mse_n, va_mse_r = mse_split(T_xh, Xva, Hva, mu_h, std_h)
+te_mse_n, te_mse_r = mse_split(T_xh, Xte, Hte, mu_h, std_h)
+
+print(f"[T(x)->h MSE — normalized] train={tr_mse_n:.6f} | val={va_mse_n:.6f} | test={te_mse_n:.6f}")
+print(f"[T(x)->h MSE — raw]        train={tr_mse_r:.6f}  | val={va_mse_r:.6f}  | test={te_mse_r:.6f}")
+
+@torch.no_grad()
+def mean_hard_actives(T, X, bs=2048):
+    T.eval().to(device)
+    acts = []
+    for i in range(0, X.size(0), bs):
+        x = X[i:i+bs].to(device)
+        _, _, u, _, _ = T(x)
+        acts.append((u > T.theta_h).float().sum(dim=1).cpu())
+    acts = torch.cat(acts, 0)
+    return float(acts.mean()), float(acts.median()), float(acts.quantile(0.95))
+
+l0_mean, l0_med, l0_p95 = mean_hard_actives(T_xh, Xva)
+print(f"[T(x)->h L0 (hard gate count) — VAL] mean={l0_mean:.2f} | median={l0_med:.2f} | p95={l0_p95:.2f}")
+
+
+# Cell 29 — Optional fidelity: use T(x) logits directly to score CE/Acc vs labels
+
+@torch.no_grad()
+def ce_acc_with_T_logits(loader, T, mu_h=None, std_h=None):
+    T.eval().to(device)
+    ce_sum=0.0; correct=0; seen=0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device).long()
+        x_flat = xb.view(xb.size(0), -1)
+        h_hat_n, _f, _u, _s, _h = T(x_flat)
+        logits = h_hat_n * (std_h.to(device) + 1e-8) + mu_h.to(device) if (mu_h is not None) else h_hat_n
+        ce_sum += F.cross_entropy(logits, yb, reduction="sum").item()
+        correct += (logits.argmax(dim=1) == yb).sum().item()
+        seen += yb.numel()
+    return ce_sum/max(seen,1), correct/max(seen,1)
+
+# Baseline CE/Acc from modelA logits
+tr_ce_base, tr_acc_base = ce_and_acc_over_img_loader(modelA, dl_train_tx, device=device)
+va_ce_base, va_acc_base = ce_and_acc_over_img_loader(modelA, dl_val_tx,   device=device)
+te_ce_base, te_acc_base = ce_and_acc_over_img_loader(modelA, dl_test_tx,  device=device)
+
+# CE/Acc from T(x) logits
+tr_ce_T, tr_acc_T = ce_acc_with_T_logits(dl_train_tx, T_xh, mu_h, std_h)
+va_ce_T, va_acc_T = ce_acc_with_T_logits(dl_val_tx,   T_xh, mu_h, std_h)
+te_ce_T, te_acc_T = ce_acc_with_T_logits(dl_test_tx,  T_xh, mu_h, std_h)
+
+print("=== CE/Acc using T(x) logits ===")
+print(f"TRAIN | CE base {tr_ce_base:.4f} | CE T {tr_ce_T:.4f} | ΔCE {tr_ce_T - tr_ce_base:+.4f} | Acc base {tr_acc_base:.4f} | Acc T {tr_acc_T:.4f} | ΔAcc {tr_acc_T - tr_acc_base:+.4f}")
+print(f"VAL   | CE base {va_ce_base:.4f} | CE T {va_ce_T:.4f} | ΔCE {va_ce_T - va_ce_base:+.4f} | Acc base {va_acc_base:.4f} | Acc T {va_acc_T:.4f} | ΔAcc {va_acc_T - va_acc_base:+.4f}")
+print(f"TEST  | CE base {te_ce_base:.4f} | CE T {te_ce_T:.4f} | ΔCE {te_ce_T - te_ce_base:+.4f} | Acc base {te_acc_base:.4f} | Acc T {te_acc_T:.4f} | ΔAcc {te_acc_T - te_acc_base:+.4f}")
+
+
+# Cell 30 — Collect (h1, h2) from modelA (d=1024 → 10)
+# h1 = ReLU(W_in @ x), h2 = W_out @ h1
+
+@torch.no_grad()
+def collect_h1_h2(model, loader):
+    model.eval().to(device)
+    H1, H2, Y = [], [], []
+    for xb, yb in loader:
+        xb = xb.to(device); yb = yb.to(device).long()
+        x_flat = xb.view(xb.size(0), -1)
+        z  = torch.einsum('bi,ih->bh', x_flat, model.ffn.W_in_ih)   # pre-acts
+        h1 = F.relu(z)                                              # (B, 1024)
+        h2 = torch.einsum('bh,ho->bo', h1, model.ffn.W_out_ho)      # logits (B, 10)
+        H1.append(h1.cpu()); H2.append(h2.cpu()); Y.append(yb.cpu())
+    return torch.cat(H1), torch.cat(H2), torch.cat(Y)
+
+# Use the same 1024-wide modelA you trained earlier
+H1_tr, H2_tr, Y_tr = collect_h1_h2(modelA, dl_train_tx)
+H1_va, H2_va, Y_va = collect_h1_h2(modelA, dl_val_tx)
+H1_te, H2_te, Y_te = collect_h1_h2(modelA, dl_test_tx)
+
+# Normalize targets h2 (primary MSE reported in this space)
+mu_h2  = H2_tr.mean(0, keepdim=True)
+std_h2 = H2_tr.std(0, keepdim=True).clamp_min(1e-6)
+
+H2_tr_n = (H2_tr - mu_h2) / std_h2
+H2_va_n = (H2_va - mu_h2) / std_h2
+H2_te_n = (H2_te - mu_h2) / std_h2
+
+def loader_h1_h2(H1, H2n, bs=256, shuffle=True):
+    return DataLoader(
+        TensorDataset(H1, H2n),
+        batch_size=bs, shuffle=shuffle, num_workers=0, pin_memory=torch.cuda.is_available()
+    )
+
+dl_h_tr = loader_h1_h2(H1_tr, H2_tr_n, bs=256, shuffle=True)
+dl_h_va = loader_h1_h2(H1_va, H2_va_n, bs=256, shuffle=False)
+dl_h_te = loader_h1_h2(H1_te, H2_te_n, bs=256, shuffle=False)
+
+
+# Cell 31 — JumpReLU Transcoder T: h1(1024) → h2(10) with L0 penalty
+
+TXH_LATENTS = 128    # hidden features inside T; adjust if you want sparser/denser
+TXH_TAU     = 0.1
+TXH_LAMBDA  = 1e-2   # L0 (soft) weight
+TXH_LR      = 1e-3
+TXH_EPOCHS  = 5
+
+class TranscoderH1toH2(pl.LightningModule):
+    def __init__(self, d_in=1024, d_lat=TXH_LATENTS, d_out=10, tau=TXH_TAU,
+                 init_theta=0.5, lambda_l0=TXH_LAMBDA, lr=TXH_LR):
+        super().__init__()
+        self.save_hyperparameters()
+        self.enc = nn.Linear(d_in, d_lat, bias=True)
+        self.theta_h = nn.Parameter(torch.full((d_lat,), init_theta))
+        self.dec = nn.Linear(d_lat, d_out, bias=True)
+        self.tau = tau
+    def forward(self, h1):
+        u = self.enc(h1)
+        soft = torch.sigmoid((u - self.theta_h)/self.tau)
+        hard = (u > self.theta_h).float()
+        gate = (hard - soft).detach() + soft
+        f = u * gate
+        h2_hat_n = self.dec(f)             # predicts normalized h2
+        return h2_hat_n, f, u, soft, hard
+    def _step(self, batch):
+        h1, h2_tgt_n = (t.to(self.device) for t in batch)
+        h2_hat_n, f, u, soft, hard = self(h1)
+        recon = F.mse_loss(h2_hat_n, h2_tgt_n, reduction="mean")
+        l0_soft = soft.sum(dim=1).mean()
+        loss = recon + self.hparams.lambda_l0 * l0_soft
+        l0_hard = hard.sum(dim=1).float().mean().detach()
+        return loss, recon.detach(), l0_soft.detach(), l0_hard
+    def training_step(self, batch, _):
+        loss, recon, l0s, l0h = self._step(batch)
+        self.log_dict({"train/recon_mse":recon, "train/l0_soft":l0s, "train/l0_hard":l0h}, prog_bar=True)
+        return loss
+    def validation_step(self, batch, _):
+        _, recon, l0s, l0h = self._step(batch)
+        self.log_dict({"val/recon_mse":recon, "val/l0_soft":l0s, "val/l0_hard":l0h}, prog_bar=True)
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+T_h1h2 = TranscoderH1toH2(d_in=H1_tr.shape[1], d_out=H2_tr.shape[1])
+_tr = _trainer(TXH_EPOCHS)
+_tr.fit(T_h1h2, dl_h_tr, dl_h_va)
+
+
+# Cell 32 — Metrics: MSE (normalized/raw) + L0 on VAL
+
+@torch.no_grad()
+def mse_over_pairs(T, H1, H2_raw, mu, std, bs=2048):
+    T.eval().to(device)
+    tot_n=tot_r=0.0; cnt_n=cnt_r=0
+    for i in range(0, H1.size(0), bs):
+        h1  = H1[i:i+bs].to(device)
+        h2r = H2_raw[i:i+bs].to(device)
+        h2n = (h2r - mu.to(device)) / (std.to(device) + 1e-8)
+        h2hat_n, *_ = T(h1)
+        # normalized MSE
+        diff_n = h2hat_n - h2n
+        tot_n += diff_n.pow(2).sum().item(); cnt_n += diff_n.numel()
+        # raw MSE (de-normalize)
+        h2hat_r = h2hat_n * (std.to(device)+1e-8) + mu.to(device)
+        diff_r = h2hat_r - h2r
+        tot_r += diff_r.pow(2).sum().item(); cnt_r += diff_r.numel()
+    return tot_n/cnt_n, tot_r/cnt_r
+
+tr_mse_n, tr_mse_r = mse_over_pairs(T_h1h2, H1_tr, H2_tr, mu_h2, std_h2)
+va_mse_n, va_mse_r = mse_over_pairs(T_h1h2, H1_va, H2_va, mu_h2, std_h2)
+te_mse_n, te_mse_r = mse_over_pairs(T_h1h2, H1_te, H2_te, mu_h2, std_h2)
+
+print(f"[T(h1)->h2 MSE — normalized] train={tr_mse_n:.6f} | val={va_mse_n:.6f} | test={te_mse_n:.6f}")
+print(f"[T(h1)->h2 MSE — raw]        train={tr_mse_r:.6f}  | val={va_mse_r:.6f}  | test={te_mse_r:.6f}")
+
+@torch.no_grad()
+def l0_stats(T, H1, bs=4096):
+    T.eval().to(device)
+    acts=[]
+    for i in range(0, H1.size(0), bs):
+        h1 = H1[i:i+bs].to(device)
+        _, _, u, _, _ = T(h1)
+        acts.append((u > T.theta_h).float().sum(dim=1).cpu())
+    a = torch.cat(acts, 0)
+    return float(a.mean()), float(a.median()), float(a.quantile(0.95))
+
+l0_mean, l0_med, l0_p95 = l0_stats(T_h1h2, H1_va)
+print(f"[T(h1)->h2 L0 — VAL] mean={l0_mean:.2f} | median={l0_med:.2f} | p95={l0_p95:.2f}")
+
+
+# Cell 33 — Functional check: CE/Acc using h2_hat (raw) as logits
+# This measures how well T replaces the final linear layer of modelA.
+
+@torch.no_grad()
+def ce_acc_from_h1_with_T(H1, Y, T, mu, std, bs=2048):
+    T.eval().to(device)
+    ce_sum=0.0; correct=0; seen=0
+    for i in range(0, H1.size(0), bs):
+        h1 = H1[i:i+bs].to(device)
+        y  = Y[i:i+bs].to(device).long()
+        h2hat_n, *_ = T(h1)
+        h2hat_r = h2hat_n * (std.to(device)+1e-8) + mu.to(device)  # raw logits
+        ce_sum += F.cross_entropy(h2hat_r, y, reduction="sum").item()
+        correct += (h2hat_r.argmax(dim=1) == y).sum().item()
+        seen += y.numel()
+    return ce_sum/max(seen,1), correct/max(seen,1)
+
+# Baseline logits from modelA (for reference)
+@torch.no_grad()
+def ce_acc_modelA_from_x(model, loader):
+    ce, acc = ce_and_acc_over_img_loader(model, loader, device=device)
+    return ce, acc
+
+ceA_val, accA_val = ce_acc_modelA_from_x(modelA, dl_val_tx)
+ceA_te,  accA_te  = ce_acc_modelA_from_x(modelA, dl_test_tx)
+
+ceT_val, accT_val = ce_acc_from_h1_with_T(H1_va, Y_va, T_h1h2, mu_h2, std_h2)
+ceT_te,  accT_te  = ce_acc_from_h1_with_T(H1_te, Y_te, T_h1h2, mu_h2, std_h2)
+
+print("Functional fidelity T(h1)->h2 (same MLP)")
+print(f"VAL  | CE base {ceA_val:.4f} | CE T {ceT_val:.4f} | ΔCE {ceT_val - ceA_val:+.4f} | Acc base {accA_val:.4f} | Acc T {accT_val:.4f} | ΔAcc {accT_val - accA_val:+.4f}")
+print(f"TEST | CE base {ceA_te:.4f}  | CE T {ceT_te:.4f}  | ΔCE {ceT_te - ceA_te:+.4f}  | Acc base {accA_te:.4f}  | Acc T {accT_te:.4f}  | ΔAcc {accT_te - accA_te:+.4f}")
+
+
+# Cells 34-40: String Reversal with Tracr/Transformer (COMMENTED OUT - JAX/NumPy incompatibility)
+# These cells require JAX which needs NumPy 2.0+, but we use NumPy 1.x for PyTorch Lightning
+# To run these, create a separate environment with NumPy 2.0+
+
+# # Cell 34: Generate string reversal dataset
+# VOCAB = list("abcd")
+# BOS = "BOS"
+# PAD = "<PAD>"
+# MAX_LEN = 5
+# 
+# stoi = {tok: i for i, tok in enumerate([BOS, PAD] + VOCAB)}
+# itos = {i: tok for tok, i in stoi.items()}
+# 
+# def generate_example():
+#     seq = np.random.choice(VOCAB, size=np.random.randint(2, MAX_LEN+1)).tolist()
+#     return [BOS] + seq, [BOS] + seq[::-1]
+# 
+# def encode(seq, max_len=MAX_LEN+1):
+#     ids = [stoi[t] for t in seq]
+#     while len(ids) < max_len:  # pad
+#         ids.append(stoi[PAD])
+#     return ids
+# 
+# N_SAMPLES = 2000
+# data = [generate_example() for _ in range(N_SAMPLES)]
+# inputs, targets = zip(*data)
+# 
+# inputs_toks = torch.tensor([encode(seq) for seq in inputs])
+# targets_toks = torch.tensor([encode(seq) for seq in targets])
+# 
+# print("Input shape:", inputs_toks.shape, "Target shape:", targets_toks.shape)
+# 
+# 
+# # Cell 35: Tokenize sequences with padding
+# PAD = "<PAD>"
+# stoi = {tok: i for i, tok in enumerate([BOS, PAD] + VOCAB)}
+# itos = {i: tok for tok, i in stoi.items()}
+# 
+# def encode(seq, max_len=MAX_LEN+1):  # +1 for BOS
+#     seq_ids = [stoi[t] for t in seq]
+#     # pad with PAD token
+#     while len(seq_ids) < max_len:
+#         seq_ids.append(stoi[PAD])
+#     return seq_ids
+# 
+# def decode(seq):
+#     return [itos[i] for i in seq if itos[i] != PAD]
+# 
+# inputs_toks = torch.tensor([encode(seq) for seq in inputs])
+# targets_toks = torch.tensor([encode(seq) for seq in targets])
+# 
+# print("Tokenized input shape:", inputs_toks.shape)
+# print("Tokenized target shape:", targets_toks.shape)
+# print("Example decoded input:", decode(inputs_toks[0].tolist()))
+# print("Example decoded target:", decode(targets_toks[0].tolist()))
+# 
+# 
+# # Cell 35A: Build reversal Transformer with vocab aligned to tokenizer
+# from transformer_lens import HookedTransformer, HookedTransformerConfig
+# from tracr.rasp import rasp
+# from tracr.compiler import compiling
+# 
+# def build_program(name="reverse"):
+#     if name == "reverse":
+#         def make_length():
+#             all_true = rasp.Select(rasp.tokens, rasp.tokens, rasp.Comparison.TRUE)
+#             return rasp.SelectorWidth(all_true)
+#         length = make_length()
+#         opp_index = length - rasp.indices - 1
+#         flip = rasp.Select(rasp.indices, opp_index, rasp.Comparison.EQ)
+#         return rasp.Aggregate(flip, rasp.tokens)
+#     else:
+#         same_index = rasp.Select(rasp.indices, rasp.indices, rasp.Comparison.EQ)
+#         return rasp.Aggregate(same_index, rasp.tokens)
+# 
+# program = build_program("reverse")
+# model = compiling.compile_rasp_to_model(
+#     program,
+#     vocab=set(stoi.values()),  # match tokenizer
+#     max_seq_len=MAX_LEN+1,
+#     compiler_bos=BOS,
+# )
+# 
+# cfg = HookedTransformerConfig(
+#     n_layers=model.model_config.num_layers,
+#     d_model=model.params["token_embed"]["embeddings"].shape[1],
+#     d_head=model.model_config.key_size,
+#     d_mlp=model.model_config.mlp_hidden_size,
+#     n_heads=model.model_config.num_heads,
+#     n_ctx=model.params["pos_embed"]["embeddings"].shape[0],
+#     d_vocab=len(stoi),
+#     d_vocab_out=len(stoi),
+#     act_fn="relu",
+#     attention_dir="causal" if model.model_config.causal else "bidirectional",
+#     normalization_type="LN" if model.model_config.layer_norm else None,
+# )
+# tl_model = HookedTransformer(cfg)
+# print("tl_model built for reversal")
+# 
+# 
+# # Cell 36: Run model with cache
+# _, cache = tl_model.run_with_cache(inputs_toks.to(device))
+# print("Cache keys:", list(cache.keys())[:8])
+# 
+# 
+# # Cell 37: Extract activations (residual stream, last layer)
+# layer = tl_model.cfg.n_layers - 1
+# acts = cache["resid_post", layer].detach().cpu().float()
+# acts = acts.reshape(-1, acts.shape[-1])
+# print("Acts shape:", acts.shape)
+# 
+# dl_sae = DataLoader(TensorDataset(acts), batch_size=BATCH_SAE, shuffle=True)
+# 
+# 
+# # Cell 38: SAE (JumpReLU style)
+# class SAE(nn.Module):
+#     def __init__(self, d_in, d_hidden):
+#         super().__init__()
+#         self.enc = nn.Linear(d_in, d_hidden, bias=False)
+#         self.theta = nn.Parameter(torch.full((d_hidden,), INIT_THETA))
+#         self.dec = nn.Linear(d_hidden, d_in, bias=False)
+# 
+#     def forward(self, x):
+#         u = self.enc(x)
+#         # Straight-Through Estimator for JumpReLU
+#         soft = torch.sigmoid((u - self.theta) / TAU)
+#         hard = (u > self.theta).float()
+#         gate = (hard - soft).detach() + soft
+#         h = u * gate
+#         return self.dec(h), h
+# 
+# 
+# # Cell 39: Train SAE
+# sae = SAE(d_in=acts.shape[-1], d_hidden=SAE_LATENTS).to(device)
+# opt = torch.optim.Adam(sae.parameters(), lr=LR_SAE_FINAL)
+# for epoch in range(EPOCHS_SAE_FINAL):
+#     for (batch,) in dl_sae:
+#         batch = batch.to(device)
+#         recon, _ = sae(batch)
+#         loss = F.mse_loss(recon, batch)
+#         opt.zero_grad(); loss.backward(); opt.step()
+#     print(f"Epoch {epoch+1}: loss={loss.item():.4f}")
+# 
+# 
+# # Cell 40: Inspect SAE
+# sample, = next(iter(dl_sae))
+# recon, h = sae(sample.to(device))
+# print("Input shape:", sample.shape)
+# print("Hidden sparsity avg:", h.sum(-1).float().mean().item())
+
+print("\n" + "="*70)
+print("SKIPPED: Tracr/Transformer section (Cells 34-40)")
+print("Reason: JAX requires NumPy 2.0+, incompatible with current setup")
+print("="*70 + "\n")
+
+
+# Cell 41: Collect activation database for mechanistic interpretability
+# This collects sparse latent activations (f_bh) for every MNIST image
+# along with metadata (image index, label, split) for manual hypothesis generation
+
+import os
+import pickle
+
+@torch.no_grad()
+def collect_sae_activations(model, sae, loader, mu_bo, std_bo, split_name="train"):
+    """
+    Collect SAE latent activations for all images in a dataloader.
+
+    Returns:
+        activations_db: list of dicts with keys:
+            - 'image_idx': global index within the split
+            - 'activations': (SAE_LATENTS,) tensor of sparse latent values
+            - 'label': ground truth digit
+            - 'split': 'train', 'val', or 'test'
+            - 'image': (28, 28) original MNIST image
+    """
+    model.eval().to(device)
+    sae.eval().to(device)
+
+    activations_db = []
+    global_idx = 0
+
+    for x_bchw, y_gt in loader:
+        x_bchw = x_bchw.to(device)
+        y_gt = y_gt.to(device)
+
+        # Get logits from base model
+        x_bi = x_bchw.view(x_bchw.size(0), -1)
+        y_raw_bO = model.ffn(x_bi)
+
+        # Normalize logits
+        y_n_bO = (y_raw_bO - mu_bo.to(device)) / std_bo.to(device)
+
+        # Pass through SAE and get sparse latents (f_bh)
+        y_hat_n_bO, f_bh, u_bh, soft_bh, hard_bh = sae(y_n_bO)
+
+        # Store each image's data
+        for i in range(x_bchw.size(0)):
+            activations_db.append({
+                'image_idx': global_idx,
+                'activations': f_bh[i].cpu(),  # sparse latent activations
+                'label': y_gt[i].cpu().item(),
+                'split': split_name,
+                'image': x_bchw[i, 0].cpu(),  # (28, 28) image
+            })
+            global_idx += 1
+
+    return activations_db
+
+print("\n=== Collecting SAE Activation Database ===")
+print("This will collect sparse latent activations for all MNIST images...")
+
+# Collect activations for all splits
+db_train = collect_sae_activations(model, sae_final, dl_train, mu_bo, std_bo, split_name="train")
+db_val   = collect_sae_activations(model, sae_final, dl_val,   mu_bo, std_bo, split_name="val")
+db_test  = collect_sae_activations(model, sae_final, dl_test,  mu_bo, std_bo, split_name="test")
+
+# Combine all splits
+activation_database = db_train + db_val + db_test
+
+print(f"Collected activations for {len(activation_database)} images")
+print(f"  Train: {len(db_train)} images")
+print(f"  Val:   {len(db_val)} images")
+print(f"  Test:  {len(db_test)} images")
+
+# Save to disk
+db_path = os.path.join(OUT_DIR, "activation_database.pkl")
+with open(db_path, "wb") as f:
+    pickle.dump({
+        'database': activation_database,
+        'num_latents': SAE_LATENTS,
+        'metadata': {
+            'sae_config': {
+                'latents': SAE_LATENTS,
+                'tau': TAU,
+                'init_theta': INIT_THETA,
+                'target_actives': TARGET_ACTIVES,
+            },
+            'normalization': {'mu': mu_bo, 'std': std_bo},
+        }
+    }, f)
+
+print(f"\nSaved activation database to: {db_path}")
+
+
+# Cell 42: Top-k retrieval and neuron statistics
+# Functions to analyze which images activate each neuron most strongly
+
+def get_top_k_activations(database, neuron_id, k=20):
+    """
+    Get the top-k images that most strongly activate a specific neuron.
+
+    Args:
+        database: list of dicts from collect_sae_activations
+        neuron_id: which latent neuron to analyze (0 to SAE_LATENTS-1)
+        k: how many top images to retrieve
+
+    Returns:
+        list of dicts with keys: image_idx, activation_value, label, split, image
+    """
+    # Extract activation values for this neuron from all images
+    results = []
+    for entry in database:
+        activation_val = entry['activations'][neuron_id].item()
+        results.append({
+            'image_idx': entry['image_idx'],
+            'activation_value': activation_val,
+            'label': entry['label'],
+            'split': entry['split'],
+            'image': entry['image'],
+        })
+
+    # Sort by activation value (descending) and take top-k
+    results.sort(key=lambda x: x['activation_value'], reverse=True)
+    return results[:k]
+
+
+def compute_neuron_statistics(database, neuron_id, activation_threshold=0.0):
+    """
+    Compute statistics for a specific neuron.
+
+    Args:
+        database: activation database
+        neuron_id: which neuron to analyze
+        activation_threshold: minimum activation to count as "firing"
+
+    Returns:
+        dict with statistics:
+            - mean_activation: average activation across all images
+            - firing_rate: fraction of images where activation > threshold
+            - label_distribution: dict mapping digit -> count of top activations
+            - max_activation: maximum activation value seen
+    """
+    activations = []
+    firing_count = 0
+    label_counts = {i: 0 for i in range(10)}
+
+    for entry in database:
+        act_val = entry['activations'][neuron_id].item()
+        activations.append(act_val)
+        if act_val > activation_threshold:
+            firing_count += 1
+            label_counts[entry['label']] += 1
+
+    activations = np.array(activations)
+
+    return {
+        'neuron_id': neuron_id,
+        'mean_activation': float(activations.mean()),
+        'max_activation': float(activations.max()),
+        'firing_rate': firing_count / len(database) if len(database) > 0 else 0.0,
+        'label_distribution': label_counts,
+        'num_images': len(database),
+    }
+
+
+def analyze_all_neurons(database, num_latents=SAE_LATENTS):
+    """
+    Compute statistics for all neurons in the SAE.
+
+    Returns:
+        list of dicts (one per neuron) with statistics
+    """
+    stats = []
+    for neuron_id in range(num_latents):
+        neuron_stats = compute_neuron_statistics(database, neuron_id)
+        stats.append(neuron_stats)
+    return stats
+
+
+# Compute statistics for all neurons
+print("\n=== Computing Neuron Statistics ===")
+neuron_stats = analyze_all_neurons(activation_database, num_latents=SAE_LATENTS)
+
+# Save stats
+stats_path = os.path.join(OUT_DIR, "neuron_statistics.pkl")
+with open(stats_path, "wb") as f:
+    pickle.dump(neuron_stats, f)
+
+print(f"Saved neuron statistics to: {stats_path}")
+
+# Print summary
+print("\n=== Neuron Statistics Summary ===")
+print(f"{'Neuron':<8} {'Mean Act':<12} {'Max Act':<12} {'Fire Rate':<12} {'Top Label (Count)'}")
+print("-" * 70)
+for stats in neuron_stats[:10]:  # Show first 10 neurons
+    nid = stats['neuron_id']
+    mean_act = stats['mean_activation']
+    max_act = stats['max_activation']
+    fire_rate = stats['firing_rate']
+    # Find most common label
+    top_label = max(stats['label_distribution'].items(), key=lambda x: x[1])
+    print(f"{nid:<8} {mean_act:<12.4f} {max_act:<12.4f} {fire_rate:<12.2%} {top_label[0]} ({top_label[1]})")
+
+print(f"\n... (showing first 10 of {SAE_LATENTS} neurons)")
+
+
+# Example: Get top-20 images for neuron 0
+print("\n=== Example: Top-20 images for Neuron 0 ===")
+top_images_n0 = get_top_k_activations(activation_database, neuron_id=0, k=20)
+print(f"{'Rank':<6} {'Activation':<12} {'Label':<8} {'Split'}")
+print("-" * 40)
+for rank, img_data in enumerate(top_images_n0[:10], 1):  # Show top 10
+    print(f"{rank:<6} {img_data['activation_value']:<12.4f} {img_data['label']:<8} {img_data['split']}")
+
+
+# Cell 43: Visualization utilities for manual hypothesis generation
+# Display top-k activating images for each neuron in a grid
+
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+def visualize_top_k_for_neuron(database, neuron_id, k=20, save_path=None):
+    """
+    Create a visualization grid showing the top-k images that activate a neuron.
+
+    Args:
+        database: activation database
+        neuron_id: which neuron to visualize
+        k: number of top images to show
+        save_path: optional path to save the figure
+    """
+    top_images = get_top_k_activations(database, neuron_id, k=k)
+
+    # Compute neuron statistics
+    stats = compute_neuron_statistics(database, neuron_id)
+
+    # Create figure
+    n_cols = 5
+    n_rows = (k + n_cols - 1) // n_cols
+    fig = plt.figure(figsize=(12, 2.5 * n_rows))
+
+    # Add title with neuron statistics
+    top_label = max(stats['label_distribution'].items(), key=lambda x: x[1])
+    fig.suptitle(
+        f"Neuron {neuron_id} | Mean Act: {stats['mean_activation']:.3f} | "
+        f"Fire Rate: {stats['firing_rate']:.1%} | Top Label: {top_label[0]} ({top_label[1]} imgs)",
+        fontsize=14, fontweight='bold'
+    )
+
+    # Plot each top image
+    for idx, img_data in enumerate(top_images):
+        ax = fig.add_subplot(n_rows, n_cols, idx + 1)
+        ax.imshow(img_data['image'], cmap='gray')
+        ax.set_title(
+            f"#{idx+1}: {img_data['label']}\nAct={img_data['activation_value']:.3f}",
+            fontsize=9
+        )
+        ax.axis('off')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved visualization to: {save_path}")
+
+    return fig
+
+
+def visualize_all_neurons(database, num_latents=SAE_LATENTS, k=20, output_dir=None):
+    """
+    Create visualization grids for all neurons and save them.
+
+    Args:
+        database: activation database
+        num_latents: number of SAE latents
+        k: top-k images per neuron
+        output_dir: directory to save visualizations
+    """
+    if output_dir is None:
+        output_dir = os.path.join(OUT_DIR, "neuron_visualizations")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\n=== Generating Visualizations for All {num_latents} Neurons ===")
+    for neuron_id in range(num_latents):
+        save_path = os.path.join(output_dir, f"neuron_{neuron_id:02d}_top{k}.png")
+        fig = visualize_top_k_for_neuron(database, neuron_id, k=k, save_path=save_path)
+        plt.close(fig)  # Close to avoid memory issues
+
+        if (neuron_id + 1) % 5 == 0:
+            print(f"  Completed {neuron_id + 1}/{num_latents} neurons")
+
+    print(f"\nAll visualizations saved to: {output_dir}")
+
+
+def create_hypothesis_template(neuron_stats, output_path=None):
+    """
+    Create a template file for manually recording hypotheses about each neuron.
+
+    Args:
+        neuron_stats: list of neuron statistics dicts
+        output_path: path to save the template markdown file
+    """
+    if output_path is None:
+        output_path = os.path.join(OUT_DIR, "hypothesis_template.md")
+
+    with open(output_path, "w") as f:
+        f.write("# SAE Neuron Interpretation Hypotheses\n\n")
+        f.write(f"Total Neurons: {len(neuron_stats)}\n\n")
+        f.write("---\n\n")
+
+        for stats in neuron_stats:
+            nid = stats['neuron_id']
+            mean_act = stats['mean_activation']
+            max_act = stats['max_activation']
+            fire_rate = stats['firing_rate']
+            top_label = max(stats['label_distribution'].items(), key=lambda x: x[1])
+
+            f.write(f"## Neuron {nid}\n\n")
+            f.write(f"**Statistics:**\n")
+            f.write(f"- Mean Activation: {mean_act:.4f}\n")
+            f.write(f"- Max Activation: {max_act:.4f}\n")
+            f.write(f"- Firing Rate: {fire_rate:.2%}\n")
+            f.write(f"- Most Common Label: {top_label[0]} ({top_label[1]} images)\n")
+            f.write(f"- Label Distribution: {dict(stats['label_distribution'])}\n\n")
+
+            f.write(f"**Hypothesis:**\n")
+            f.write(f"- [ ] Monosemantic (represents one concept)\n")
+            f.write(f"- [ ] Polysemantic (represents multiple concepts)\n")
+            f.write(f"- [ ] Dead neuron (rarely/never activates)\n\n")
+
+            f.write(f"**Interpretation:**\n")
+            f.write(f"> _TODO: Describe what this neuron represents based on top activating images_\n\n")
+
+            f.write(f"**Visual Features:**\n")
+            f.write(f"- Primary digit(s): \n")
+            f.write(f"- Key features detected: \n")
+            f.write(f"- Notes: \n\n")
+
+            f.write("---\n\n")
+
+    print(f"\nCreated hypothesis template: {output_path}")
+    return output_path
+
+
+# Generate visualizations for all neurons
+visualize_all_neurons(activation_database, num_latents=SAE_LATENTS, k=20)
+
+# Create hypothesis template
+template_path = create_hypothesis_template(neuron_stats)
+
+print("\n" + "="*70)
+print("ACTIVATION DATABASE COLLECTION COMPLETE!")
+print("="*70)
+print("\nGenerated files:")
+print(f"  1. {os.path.join(OUT_DIR, 'activation_database.pkl')}")
+print(f"  2. {os.path.join(OUT_DIR, 'neuron_statistics.pkl')}")
+print(f"  3. {os.path.join(OUT_DIR, 'neuron_visualizations/')} (directory with {SAE_LATENTS} images)")
+print(f"  4. {template_path}")
+print("\nNext steps for manual interpretation:")
+print("  1. Review visualizations in neuron_visualizations/")
+print("  2. Fill out hypothesis_template.md with your observations")
+print("  3. Identify monosemantic vs polysemantic neurons")
+print("  4. Document visual features each neuron detects")
+print("="*70)
