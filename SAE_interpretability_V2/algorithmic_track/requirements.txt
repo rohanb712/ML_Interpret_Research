@@ -1,0 +1,33 @@
+# Core dependencies for TRACR + TransformerLens + SAE
+numpy==1.26.4
+torch==2.5.1
+typing_extensions>=4.9.0
+
+# JAX ecosystem (CPU version for Windows - GPU requires WSL)
+jax[cpu]==0.4.28
+# Note: For GPU on Windows, you need WSL2 and different JAX installation
+
+# Tracr dependencies
+dm-haiku>=0.0.9
+absl-py>=1.0.0
+chex==0.1.86
+optax==0.2.2
+toolz==0.12.0
+einops>=0.6.0
+tabulate>=0.8.9
+jmp>=0.0.2
+networkx>=2.5
+
+# TransformerLens (compatible with torch 2.5.1)
+transformer_lens<2.16
+
+# PyTorch Lightning
+pytorch_lightning>=2.0.0
+
+# Additional utilities
+opt_einsum==3.3.0
+ml_dtypes==0.2.0
+
+# Tracr (install from git after other dependencies)
+# Run: pip install git+https://github.com/neelnanda-io/Tracr.git@main
+

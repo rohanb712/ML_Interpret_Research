@@ -1,33 +1,40 @@
-# Cell 0
-%pip -q install "numpy<2" typing_extensions>=4.9.0
-%pip -q install jax==0.4.28 jaxlib==0.4.28 ml-dtypes==0.2.0 opt_einsum==3.3.0
-%pip -q install dm-haiku absl-py chex==0.1.91 optax==0.2.5 toolz einops tabulate jmp networkx
-%pip -q install "torch==2.2.2"
-#%pip -q install "transformer_lens>=2.4.0"
-%pip -q install pytorch_lightning
+"""
+TRACR + TransformerLens + SAE Training Script
 
-import sys, torch, jax, numpy
+Setup Instructions for Windows:
+1. Create a virtual environment:
+   python -m venv venv
+   venv\Scripts\activate
+
+2. Install dependencies:
+   pip install -r requirements.txt
+   pip install git+https://github.com/neelnanda-io/Tracr.git@main
+
+3. Run this script:
+   python TRACR_TL_SAE.py
+
+Note: JAX CPU version is used by default. For GPU support on Windows, use WSL2.
+"""
+
+import sys
+import torch
+import jax
+import numpy
+
+print("=" * 60)
+print("Environment Check")
+print("=" * 60)
 print("Python:", sys.version)
 print("Torch:", torch.__version__, "CUDA:", torch.cuda.is_available())
 print("JAX:", jax.__version__, "NumPy:", numpy.__version__)
+print("=" * 60)
+
+IN_COLAB = False
 
 
-# Cell 1
-# Kip's change
-
-import google.colab
-IN_COLAB = True
-print("Running as a Colab notebook")
-%pip install transformer_lens
-try:
-    %pip install git+https://github.com/neelnanda-io/Tracr.git@main#egg=tracr
-except:
-    print("First attempt failed, trying alternative...")
-    %pip install git+https://github.com/neelnanda-io/Tracr.git
-
-
-
-# Cell 2
+# ============================================================================
+# Configuration and Setup
+# ============================================================================
 import os, json, numpy as np, torch
 import torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -54,172 +61,46 @@ TX_LATENTS, TX_TAU, TX_INIT_TH = 128, 0.1, 0.5
 TX_LAMBDA, TX_LR, TX_EPOCHS, TX_BS = 1e-2, 1e-3, 5, 256
 
 
-# Cell 4
-# Kip's change - imports for consistency
-from transformer_lens import HookedTransformer, HookedTransformerConfig
-import einops
-import torch
-import numpy as np
-from tracr.rasp import rasp
-from tracr.compiler import compiling
-
-
-# Cell 5
-# Kip's change - compile reverse RASP
+# ============================================================================
+# Compile RASP Program (Sequence Reversal)
+# ============================================================================
 def make_length():
     all_true_selector = rasp.Select(rasp.tokens, rasp.tokens, rasp.Comparison.TRUE)
     return rasp.SelectorWidth(all_true_selector)
 
-length = make_length()
-opp_index = length - rasp.indices - 1
-flip = rasp.Select(rasp.indices, opp_index, rasp.Comparison.EQ)
-prog = rasp.Aggregate(flip, rasp.tokens)
 
-bos = "BOS"
-model = compiling.compile_rasp_to_model(
-    prog,
-    vocab={1, 2, 3},
-    max_seq_len=5,
-    compiler_bos=bos,
-)
+# ============================================================================
+# Helper Functions (will be populated when model is initialized)
+# ============================================================================
+# These will be set in main()
+model = None
+tl_model = None
+bos = None
+INPUT_ENCODER = None
+OUTPUT_ENCODER = None
+n_layers = None
 
-# Quick smoke test
-out = model.apply([bos, 1, 2, 3])
-print(f"[{prog}] Tracr output (decoded):", getattr(out, "decoded", None))
-
-
-# Cell 6
-# Kip's change - map Tracr → TransformerLens
-n_heads = model.model_config.num_heads
-n_layers = model.model_config.num_layers
-d_head = model.model_config.key_size
-d_mlp = model.model_config.mlp_hidden_size
-act_fn = "relu"
-normalization_type = "LN" if model.model_config.layer_norm else None
-attention_type = "causal" if model.model_config.causal else "bidirectional"
-
-n_ctx = model.params["pos_embed"]['embeddings'].shape[0]
-d_vocab = model.params["token_embed"]['embeddings'].shape[0]
-d_model = model.params["token_embed"]['embeddings'].shape[1]
-d_vocab_out = d_vocab - 2  # trim BOS + PAD
-
-cfg = HookedTransformerConfig(
-    n_layers=n_layers,
-    d_model=d_model,
-    d_head=d_head,
-    n_ctx=n_ctx,
-    d_vocab=d_vocab,
-    d_vocab_out=d_vocab_out,
-    d_mlp=d_mlp,
-    n_heads=n_heads,
-    act_fn=act_fn,
-    attention_dir=attention_type,
-    normalization_type=normalization_type,
-)
-tl_model = HookedTransformer(cfg)
-
-sd = {}
-sd["pos_embed.W_pos"] = model.params["pos_embed"]['embeddings']
-sd["embed.W_E"] = model.params["token_embed"]['embeddings']
-sd["unembed.W_U"] = np.eye(d_model, d_vocab_out)
-
-for l in range(n_layers):
-    sd[f"blocks.{l}.attn.W_K"] = einops.rearrange(
-        model.params[f"transformer/layer_{l}/attn/key"]["w"],
-        "d_model (n_heads d_head) -> n_heads d_model d_head",
-        d_head=d_head, n_heads=n_heads
-    )
-    sd[f"blocks.{l}.attn.b_K"] = einops.rearrange(
-        model.params[f"transformer/layer_{l}/attn/key"]["b"],
-        "(n_heads d_head) -> n_heads d_head",
-        d_head=d_head, n_heads=n_heads
-    )
-    sd[f"blocks.{l}.attn.W_Q"] = einops.rearrange(
-        model.params[f"transformer/layer_{l}/attn/query"]["w"],
-        "d_model (n_heads d_head) -> n_heads d_model d_head",
-        d_head=d_head, n_heads=n_heads
-    )
-    sd[f"blocks.{l}.attn.b_Q"] = einops.rearrange(
-        model.params[f"transformer/layer_{l}/attn/query"]["b"],
-        "(n_heads d_head) -> n_heads d_head",
-        d_head=d_head, n_heads=n_heads
-    )
-    sd[f"blocks.{l}.attn.W_V"] = einops.rearrange(
-        model.params[f"transformer/layer_{l}/attn/value"]["w"],
-        "d_model (n_heads d_head) -> n_heads d_model d_head",
-        d_head=d_head, n_heads=n_heads
-    )
-    sd[f"blocks.{l}.attn.b_V"] = einops.rearrange(
-        model.params[f"transformer/layer_{l}/attn/value"]["b"],
-        "(n_heads d_head) -> n_heads d_head",
-        d_head=d_head, n_heads=n_heads
-    )
-    sd[f"blocks.{l}.attn.W_O"] = einops.rearrange(
-        model.params[f"transformer/layer_{l}/attn/linear"]["w"],
-        "(n_heads d_head) d_model -> n_heads d_head d_model",
-        d_head=d_head, n_heads=n_heads
-    )
-    sd[f"blocks.{l}.attn.b_O"] = model.params[f"transformer/layer_{l}/attn/linear"]["b"]
-
-    sd[f"blocks.{l}.mlp.W_in"] = model.params[f"transformer/layer_{l}/mlp/linear_1"]["w"]
-    sd[f"blocks.{l}.mlp.b_in"] = model.params[f"transformer/layer_{l}/mlp/linear_1"]["b"]
-    sd[f"blocks.{l}.mlp.W_out"] = model.params[f"transformer/layer_{l}/mlp/linear_2"]["w"]
-    sd[f"blocks.{l}.mlp.b_out"] = model.params[f"transformer/layer_{l}/mlp/linear_2"]["b"]
-
-print(sd.keys())
-
-
-# Cell 7
-# Kip's change - convert JAX → Torch tensors
-for k, v in sd.items():
-    sd[k] = torch.tensor(np.array(v))
-
-tl_model.load_state_dict(sd, strict=False)
-
-
-# Cell 8
-# Kip's change - helpers
-INPUT_ENCODER = model.input_encoder
-OUTPUT_ENCODER = model.output_encoder
-
-def create_model_input(input, input_encoder=INPUT_ENCODER):
+def create_model_input(input, input_encoder=None):
+    """Create model input tensor from sequence."""
+    if input_encoder is None:
+        input_encoder = INPUT_ENCODER
     encoding = input_encoder.encode(input)
     return torch.tensor(encoding).unsqueeze(dim=0)
 
-def decode_model_output(logits, output_encoder=OUTPUT_ENCODER, bos_token=INPUT_ENCODER.bos_token):
+def decode_model_output(logits, output_encoder=None, bos_token=None):
+    """Decode model output logits to sequence."""
+    if output_encoder is None:
+        output_encoder = OUTPUT_ENCODER
+    if bos_token is None:
+        bos_token = INPUT_ENCODER.bos_token
     max_output_indices = logits.squeeze(dim=0).argmax(dim=-1)
     decoded_output = output_encoder.decode(max_output_indices.tolist())
     decoded_output_with_bos = [bos_token] + decoded_output[1:]
     return decoded_output_with_bos
 
-
-# Cell 9
-# Kip's change - parity test
-input = [bos, 1, 2, 3]
-out = model.apply(input)
-print("Original Decoding:", out.decoded)
-
-input_tokens_tensor = create_model_input(input)
-logits = tl_model(input_tokens_tensor)
-decoded_output = decode_model_output(logits)
-print("TransformerLens Replicated Decoding:", decoded_output)
-
-
-# Cell 10
-# Kip's change - layer parity checks
-logits, cache = tl_model.run_with_cache(input_tokens_tensor)
-for layer in range(tl_model.cfg.n_layers):
-    print(f"Layer {layer} Attn Out Equality Check:",
-          np.isclose(cache["attn_out", layer].detach().cpu().numpy(),
-                     np.array(out.layer_outputs[2*layer])).all())
-    print(f"Layer {layer} MLP Out Equality Check:",
-          np.isclose(cache["mlp_out", layer].detach().cpu().numpy(),
-                     np.array(out.layer_outputs[2*layer+1])).all())
-
-
-# Cell 11
 @torch.no_grad()
 def parity_exact_match(samples=64):
+    """Test parity between TransformerLens and Tracr models."""
     # Warm up Tracr JAX model once to avoid repeated compilation
     _ = model.apply([bos, 1, 2, 3])  
     
@@ -237,11 +118,10 @@ def parity_exact_match(samples=64):
     
     print(f"TL vs Tracr exact-match: {ok}/{samples}")
 
-parity_exact_match(64)
 
-
-# Cell 12
-# === Data collection: sample sequences + collect activations from ALL layers ===
+# ============================================================================
+# Data Collection: Sample Sequences & Collect Activations
+# ============================================================================
 
 @torch.no_grad()
 def sample_sequences(n=8000, max_len=5):
@@ -285,9 +165,9 @@ def collect_activations(token_tensors, hook_point, batch=128):
     return torch.cat(feats, dim=0)
 
 
-
-# Cell 13
-# === SAE definition + training helpers (per-layer) ===
+# ============================================================================
+# SAE Model Definition and Training
+# ============================================================================
 
 class ActDataset(torch.utils.data.Dataset):
     def __init__(self, X): self.X = X
@@ -350,20 +230,12 @@ def train_sae_for_layer(layer, l1, tag):
     return ckpt_path, model, val
 
 
-# Cell 14
-# === Train & evaluate SAEs for all layers ===
-
-print(f"\nTraining SAEs for {n_layers} layers on resid_post...")
-all_artifacts = []
-
-for layer in range(n_layers):
-    layer_artifacts = []
-    for i, lam in enumerate(LAMBDA_L0_LIST):
-        ck, model, val = train_sae_for_layer(layer, lam, f"id{i}")
-        layer_artifacts.append((lam, ck, model, val))
-    all_artifacts.append(layer_artifacts)
+# ============================================================================
+# Evaluation Function
+# ============================================================================
 
 def eval_sae(model, X, name="eval"):
+    """Evaluate SAE reconstruction quality and sparsity."""
     model.eval()
     with torch.no_grad():
         x_hat, z = model(X.to(device))
@@ -372,8 +244,173 @@ def eval_sae(model, X, name="eval"):
     print(f"{name}: recon={recon:.4e} | active_frac={active_frac:.3f}")
     return recon, active_frac
 
-print("\n=== SAE Evaluation Results ===")
-for layer in range(n_layers):
-    print(f"\n--- Layer {layer} ---")
-    for lam, ck, model, val in all_artifacts[layer]:
-        eval_sae(model, val[:1024], name=f"Layer {layer}, λ={lam:g}")
+
+# ============================================================================
+# Model Initialization Function
+# ============================================================================
+
+def initialize_models():
+    """Initialize TRACR and TransformerLens models."""
+    global model, tl_model, bos, INPUT_ENCODER, OUTPUT_ENCODER, n_layers
+    
+    # Compile RASP program
+    length = make_length()
+    opp_index = length - rasp.indices - 1
+    flip = rasp.Select(rasp.indices, opp_index, rasp.Comparison.EQ)
+    prog = rasp.Aggregate(flip, rasp.tokens)
+    
+    bos = "BOS"
+    model = compiling.compile_rasp_to_model(
+        prog,
+        vocab={1, 2, 3},
+        max_seq_len=5,
+        compiler_bos=bos,
+    )
+    
+    # Quick smoke test
+    out = model.apply([bos, 1, 2, 3])
+    print(f"[{prog}] Tracr output (decoded):", getattr(out, "decoded", None))
+    
+    # Map Tracr → TransformerLens
+    n_heads = model.model_config.num_heads
+    n_layers = model.model_config.num_layers
+    d_head = model.model_config.key_size
+    d_mlp = model.model_config.mlp_hidden_size
+    act_fn = "relu"
+    normalization_type = "LN" if model.model_config.layer_norm else None
+    attention_type = "causal" if model.model_config.causal else "bidirectional"
+    
+    n_ctx = model.params["pos_embed"]['embeddings'].shape[0]
+    d_vocab = model.params["token_embed"]['embeddings'].shape[0]
+    d_model = model.params["token_embed"]['embeddings'].shape[1]
+    d_vocab_out = d_vocab - 2  # trim BOS + PAD
+    
+    cfg = HookedTransformerConfig(
+        n_layers=n_layers,
+        d_model=d_model,
+        d_head=d_head,
+        n_ctx=n_ctx,
+        d_vocab=d_vocab,
+        d_vocab_out=d_vocab_out,
+        d_mlp=d_mlp,
+        n_heads=n_heads,
+        act_fn=act_fn,
+        attention_dir=attention_type,
+        normalization_type=normalization_type,
+    )
+    tl_model = HookedTransformer(cfg)
+    
+    sd = {}
+    sd["pos_embed.W_pos"] = model.params["pos_embed"]['embeddings']
+    sd["embed.W_E"] = model.params["token_embed"]['embeddings']
+    sd["unembed.W_U"] = np.eye(d_model, d_vocab_out)
+    
+    for l in range(n_layers):
+        sd[f"blocks.{l}.attn.W_K"] = einops.rearrange(
+            model.params[f"transformer/layer_{l}/attn/key"]["w"],
+            "d_model (n_heads d_head) -> n_heads d_model d_head",
+            d_head=d_head, n_heads=n_heads
+        )
+        sd[f"blocks.{l}.attn.b_K"] = einops.rearrange(
+            model.params[f"transformer/layer_{l}/attn/key"]["b"],
+            "(n_heads d_head) -> n_heads d_head",
+            d_head=d_head, n_heads=n_heads
+        )
+        sd[f"blocks.{l}.attn.W_Q"] = einops.rearrange(
+            model.params[f"transformer/layer_{l}/attn/query"]["w"],
+            "d_model (n_heads d_head) -> n_heads d_model d_head",
+            d_head=d_head, n_heads=n_heads
+        )
+        sd[f"blocks.{l}.attn.b_Q"] = einops.rearrange(
+            model.params[f"transformer/layer_{l}/attn/query"]["b"],
+            "(n_heads d_head) -> n_heads d_head",
+            d_head=d_head, n_heads=n_heads
+        )
+        sd[f"blocks.{l}.attn.W_V"] = einops.rearrange(
+            model.params[f"transformer/layer_{l}/attn/value"]["w"],
+            "d_model (n_heads d_head) -> n_heads d_model d_head",
+            d_head=d_head, n_heads=n_heads
+        )
+        sd[f"blocks.{l}.attn.b_V"] = einops.rearrange(
+            model.params[f"transformer/layer_{l}/attn/value"]["b"],
+            "(n_heads d_head) -> n_heads d_head",
+            d_head=d_head, n_heads=n_heads
+        )
+        sd[f"blocks.{l}.attn.W_O"] = einops.rearrange(
+            model.params[f"transformer/layer_{l}/attn/linear"]["w"],
+            "(n_heads d_head) d_model -> n_heads d_head d_model",
+            d_head=d_head, n_heads=n_heads
+        )
+        sd[f"blocks.{l}.attn.b_O"] = model.params[f"transformer/layer_{l}/attn/linear"]["b"]
+        
+        sd[f"blocks.{l}.mlp.W_in"] = model.params[f"transformer/layer_{l}/mlp/linear_1"]["w"]
+        sd[f"blocks.{l}.mlp.b_in"] = model.params[f"transformer/layer_{l}/mlp/linear_1"]["b"]
+        sd[f"blocks.{l}.mlp.W_out"] = model.params[f"transformer/layer_{l}/mlp/linear_2"]["w"]
+        sd[f"blocks.{l}.mlp.b_out"] = model.params[f"transformer/layer_{l}/mlp/linear_2"]["b"]
+    
+    print(sd.keys())
+    
+    # Convert JAX → Torch tensors
+    for k, v in sd.items():
+        sd[k] = torch.tensor(np.array(v))
+    
+    tl_model.load_state_dict(sd, strict=False)
+    
+    # Set encoders
+    INPUT_ENCODER = model.input_encoder
+    OUTPUT_ENCODER = model.output_encoder
+    
+    # Parity test
+    input = [bos, 1, 2, 3]
+    out = model.apply(input)
+    print("Original Decoding:", out.decoded)
+    
+    input_tokens_tensor = create_model_input(input)
+    logits = tl_model(input_tokens_tensor)
+    decoded_output = decode_model_output(logits)
+    print("TransformerLens Replicated Decoding:", decoded_output)
+    
+    # Layer-by-layer parity checks
+    logits, cache = tl_model.run_with_cache(input_tokens_tensor)
+    for layer in range(tl_model.cfg.n_layers):
+        print(f"Layer {layer} Attn Out Equality Check:",
+              np.isclose(cache["attn_out", layer].detach().cpu().numpy(),
+                         np.array(out.layer_outputs[2*layer])).all())
+        print(f"Layer {layer} MLP Out Equality Check:",
+              np.isclose(cache["mlp_out", layer].detach().cpu().numpy(),
+                         np.array(out.layer_outputs[2*layer+1])).all())
+    
+    # Extended parity test
+    parity_exact_match(64)
+    
+    return model, tl_model
+
+
+# ============================================================================
+# Main Training Loop
+# ============================================================================
+
+if __name__ == "__main__":
+    # Initialize models
+    model, tl_model = initialize_models()
+    
+    # Train SAEs for all layers
+    print(f"\nTraining SAEs for {n_layers} layers on resid_post...")
+    all_artifacts = []
+    
+    for layer in range(n_layers):
+        layer_artifacts = []
+        for i, lam in enumerate(LAMBDA_L0_LIST):
+            ck, sae_model, val = train_sae_for_layer(layer, lam, f"id{i}")
+            layer_artifacts.append((lam, ck, sae_model, val))
+        all_artifacts.append(layer_artifacts)
+    
+    # Evaluate trained SAEs
+    print("\n=== SAE Evaluation Results ===")
+    for layer in range(n_layers):
+        print(f"\n--- Layer {layer} ---")
+        for lam, ck, sae_model, val in all_artifacts[layer]:
+            eval_sae(sae_model, val[:1024], name=f"Layer {layer}, λ={lam:g}")
+    
+    print("\n✅ Training complete!")
+    print(f"Artifacts saved to: {OUT_DIR}")
